@@ -1679,6 +1679,20 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     chat_id, message_text, metadata=_non_conversational_metadata(send_meta, platform=platform_name),
                 )
 
+    @staticmethod
+    def _bg_process_sessions() -> list:
+        """Live ProcessSession objects for the panel.
+
+        ``process_registry.list_sessions()`` returns plain dicts without the watcher routing
+        metadata (platform / chat_id) or exit code, so read the registry maps directly.
+        """
+        from tools.process_registry import process_registry
+        try:
+            with process_registry._lock:
+                return list(process_registry._running.values()) + list(process_registry._finished.values())
+        except Exception:
+            return []
+
     async def _deliver_bg_task_card(self, watcher: dict, session) -> bool:
         """Feishu-only: fold background-task status into the chat's single collapsible panel.
 
@@ -1703,7 +1717,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return False
             current_id = getattr(session, "id", "")
             tasks: list[dict] = []
-            for s in list(process_registry.list_sessions() or []):
+            for s in self._bg_process_sessions():
                 sid = getattr(s, "id", "")
                 if sid != current_id:
                     owner_chat = getattr(s, "watcher_chat_id", "")
@@ -1755,7 +1769,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if updater is None:
                 return
             by_chat: dict[str, list[dict]] = {}
-            for s in list(process_registry.list_sessions() or []):
+            for s in self._bg_process_sessions():
                 if getattr(s, "watcher_platform", "") != "feishu":
                     continue
                 chat = getattr(s, "watcher_chat_id", "") or ""
