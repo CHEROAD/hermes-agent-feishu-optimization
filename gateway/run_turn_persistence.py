@@ -594,6 +594,24 @@ class GatewayTurnPersistenceMixin:
                 event._streamed_final_response = str(response or "")
             return None
 
+        # Fold the answer into the turn's progress card when the platform keeps one, so a
+        # turn that ran tools still occupies a single message.
+        if response and adapter is not None and not agent_result.get("failed"):
+            _folder = getattr(adapter, "append_final_to_progress_card", None)
+            if callable(_folder):
+                try:
+                    _fold_meta = {"reply_open_id": getattr(source, "user_id", None)}
+                    _folded = _folder(source.chat_id, response, _fold_meta)
+                    if inspect.isawaitable(_folded):
+                        _folded = await _folded
+                    if _folded:
+                        with suppress(Exception):
+                            event._streamed_final_response = str(response or "")
+                        agent_result["already_sent"] = True
+                        return None
+                except Exception as _fold_err:
+                    logger.debug("folding final into the progress card failed: %s", _fold_err)
+
         return response
 
     # Chat-side next steps keyed by HTTP status; Hermes commands only (/login is the gateway's own

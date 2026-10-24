@@ -259,8 +259,15 @@ class GatewayTurnProgressMixin:
             logger.debug("tool-progress onboarding hint failed: %s", err)
 
     @staticmethod
-    def _preview_cap() -> int:
-        """tool_preview_length (default 40): the one-line preview budget for "all"/"new" modes."""
+    @staticmethod
+    def _preview_cap(adapter=None) -> int:
+        """tool_preview_length (default 40): the one-line preview budget for "all"/"new" modes.
+
+        Adapters that fold progress into a collapsed panel pass ``adapter``; their text is not
+        visible until expanded, so the preview keeps the whole path/argument instead of a stub.
+        """
+        if adapter is not None and getattr(adapter, "folded_progress_full_command", False):
+            return 2000
         from agent.display import get_tool_preview_max_len
         pl = get_tool_preview_max_len()
         return pl if pl > 0 else 40
@@ -279,7 +286,7 @@ class GatewayTurnProgressMixin:
             return None, None
         cmd_full = args["command"].rstrip()
         header = "" if self._ctx.last_was_terminal_block[0] else t("gateway.progress.tool_head", emoji=emoji, tool=tool_name) + "\n"
-        cap = self._preview_cap()
+        cap = self._preview_cap(adapter)
         lines = cmd_full.splitlines()
         cmd_short = lines[0] if lines else cmd_full
         if len(cmd_short) > cap:
@@ -299,7 +306,9 @@ class GatewayTurnProgressMixin:
             adapter = None
         code_full, code_short = self._progress_terminal_blocks(adapter, tool_name, args, emoji)
         verbose = ctx.progress_mode == "verbose"
-        code = code_full if verbose else code_short
+        # Folded Feishu cards keep the whole command inside the collapsed panel.
+        full_command = verbose or getattr(adapter, "folded_progress_full_command", False)
+        code = code_full if full_command else code_short
         ctx.last_was_terminal_block[0] = code is not None
         if verbose:
             if code is None and args:
@@ -319,7 +328,7 @@ class GatewayTurnProgressMixin:
         if not preview:
             return t("gateway.progress.tool_pending", emoji=emoji, tool=tool_name)
         from agent.display import get_tool_verb, prepare_tool_preview, tool_verb_connector, verb_drops_preview
-        prepared = prepare_tool_preview(tool_name, args, fallback=preview, max_len=self._preview_cap())
+        prepared = prepare_tool_preview(tool_name, args, fallback=preview, max_len=self._preview_cap(adapter))
         preview = adapter.format_tool_preview(prepared) if adapter is not None else prepared.text
         # Friendly labels: human-phrased line for built-in tools ("🔍 Searching the web for ...")
         # by prefixing the verb onto the computed preview, so the command/url/query is kept.
@@ -596,13 +605,26 @@ class GatewayTurnProgressMixin:
             _edit_accepts_metadata=bool(ctx._progress_metadata) and _accepts_keyword(adapter.edit_message, "metadata"),
         )
 
+    def _progress_delivery_metadata(self, st) -> Optional[dict]:
+        """Progress metadata plus the running tool count for platforms that render one.
+
+        Copied rather than mutated: the same dict is reused for typing/reply sends elsewhere
+        in the turn.
+        """
+        meta = self._ctx._progress_metadata
+        if not meta:
+            return meta
+        merged = dict(meta)
+        merged["progress_tool_count"] = len(st.progress_lines)
+        return merged
+
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
         kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
-            kwargs["metadata"] = ctx._progress_metadata
+            kwargs["metadata"] = self._progress_delivery_metadata(st)
         return await st.adapter.edit_message(**kwargs)
 
     @staticmethod
@@ -624,7 +646,8 @@ class GatewayTurnProgressMixin:
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
         result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to,
+            metadata=self._progress_delivery_metadata(st),
         )
         self._track_progress_result(result)
         return result
@@ -636,6 +659,10 @@ class GatewayTurnProgressMixin:
         intact for retry — either way the caller skips the normal send/edit path this tick.
         """
         if not st.progress_lines or not st.can_edit:
+            return False
+        if getattr(st.adapter, "progress_card_survives_reset", False):
+            # Folded card: the panel is collapsed, so overflow costs no chat space. Keep the
+            # transcript in one card and let the card builder trim to the newest bytes.
             return False
         groups = self._split_progress_groups(st, st.progress_lines)
         if len(groups) <= 1:
@@ -666,6 +693,10 @@ class GatewayTurnProgressMixin:
     def _reset_progress_bubble(self, st) -> None:
         """Content bubble landed — close the tool-progress bubble so the next tool starts fresh
         below it; else tool edits hit the ORIGINAL message above (out of order)."""
+        if getattr(st.adapter, "progress_card_survives_reset", False):
+            # Feishu folded cards are a single collapsed row; keeping one card for the whole
+            # turn is the point, and the text bubble landing below it is not a reason to split.
+            return
         st.progress_msg_id, st.progress_lines = None, []
         self._ctx.last_progress_msg[0], self._ctx.repeat_count[0] = None, 0
 

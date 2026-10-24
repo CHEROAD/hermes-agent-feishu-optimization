@@ -1236,6 +1236,15 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             ),
             platform=source.platform,
         )
+        if source.platform == Platform.FEISHU:
+            # Feishu renders tool progress as a collapsed interactive card instead of a
+            # growing post bubble; the adapter owns the card shape and the in-place edits.
+            _progress_metadata = dict(_progress_metadata or {})
+            _progress_metadata["feishu_progress_card"] = True
+            # Card JSON only accepts a real open_id in an at node; without this the reply's
+            # "<at user_id=\"@_user_N\">" placeholder fails the card (230099/100290).
+            if source.user_id:
+                _progress_metadata["reply_open_id"] = source.user_id
         if _native_slack_task_cards:
             # chat.startStream in channels requires the recipient team/user pair; harmless elsewhere.
             _progress_metadata = dict(_progress_metadata or {})
