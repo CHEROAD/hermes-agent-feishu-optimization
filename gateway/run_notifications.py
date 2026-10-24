@@ -1740,6 +1740,48 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             logger.info("[bg-card] delivery failed", exc_info=True)
             return False
 
+    async def _refresh_bg_task_panel(self) -> None:
+        """Feishu: rewrite each chat's background-task panel from the live process registry.
+
+        Watchers only arm for notify-enabled jobs, so the panel is also refreshed on turn
+        boundaries and completion drains — that keeps a finished or still-running job visible
+        without depending on a live watcher.
+        """
+        try:
+            from tools.process_registry import process_registry
+            from gateway.run import _redact_gateway_user_facing_secrets, _shorten_command_for_display
+            adapter = self.adapters.get(Platform.FEISHU)
+            updater = getattr(adapter, "update_background_tasks_card", None)
+            if updater is None:
+                return
+            by_chat: dict[str, list[dict]] = {}
+            for s in list(process_registry.list_sessions() or []):
+                if getattr(s, "watcher_platform", "") != "feishu":
+                    continue
+                chat = getattr(s, "watcher_chat_id", "") or ""
+                if not chat:
+                    continue
+                started = getattr(s, "started_at", 0.0) or 0.0
+                is_exited = bool(getattr(s, "exited", False))
+                ended = getattr(s, "exited_at", 0.0) or 0.0
+                duration = max(0.0, (ended if (is_exited and ended) else time.time()) - started) if started else None
+                exit_code = getattr(s, "exit_code", None) if is_exited else None
+                status = ("done" if exit_code in (0, None) else "failed") if is_exited else "running"
+                by_chat.setdefault(chat, []).append({
+                    "id": getattr(s, "id", ""),
+                    "command": _shorten_command_for_display(
+                        _redact_gateway_user_facing_secrets(getattr(s, "command", "") or "")
+                    ),
+                    "status": status,
+                    "exit_code": exit_code,
+                    "duration": duration,
+                })
+            for chat, tasks in by_chat.items():
+                await updater(chat, tasks[-12:])
+                logger.info("[bg-card] refresh chat=%r tasks=%d", chat, len(tasks[-12:]))
+        except Exception:
+            logger.info("[bg-card] refresh failed", exc_info=True)
+
     @staticmethod
     def _build_process_completion_event(watcher: dict, session, session_id: str) -> dict:
         """Build the synthetic ``completion`` event for an agent-notify watcher."""

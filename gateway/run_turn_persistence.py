@@ -248,6 +248,13 @@ class GatewayTurnPersistenceMixin:
         except Exception as e:
             logger.debug("Watch queue drain error: %s", e)
 
+        # Feishu: refresh the background-task panel after the drain so a job that finished
+        # during this turn shows its exit code, and a long job shows as still running.
+        try:
+            await self._refresh_bg_task_panel()
+        except Exception as e:
+            logger.debug("bg task panel refresh error: %s", e)
+
     # One owner for the boundary copy (agent/turn_failure_copy.py): the core closer in
     # agent/conversation_loop.py writes the same row on the paths that never reach this layer.
 
