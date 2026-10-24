@@ -221,6 +221,8 @@ FALLBACK_ATTACHMENT_TEXT = "[Attachment]"
 _PREFERRED_LOCALES = ("zh_cn", "en_us")
 _MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
 _MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
+# ``<at user_id="ou_xxx">名字</at>`` — also matches the placeholder form the gateway emits.
+_CARD_AT_NODE_RE = re.compile(r'<at\s+user_id="([^"]*)"[^>]*>(.*?)</at>', re.S)
 _MENTION_BOUNDARY_CHARS = frozenset(" \t\n\r.,;:!?、，。；：！？()[]{}<>\"'`")
 _TRAILING_TERMINAL_PUNCT = frozenset(" \t\n\r.!?。！？")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -1258,6 +1260,134 @@ def _build_lark_client(app_id: str, app_secret: str, sdk_domain: Any) -> Any:
     return lark.Client.builder().app_id(app_id).app_secret(app_secret).domain(sdk_domain).log_level(lark.LogLevel.WARNING).build()
 
 
+def _folded_progress_enabled() -> bool:
+    """Feishu-only: render tool progress as a collapsed interactive card (one row, click to expand)."""
+    raw = os.environ.get("HERMES_FEISHU_FOLDED_PROGRESS", "1")
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _is_progress_card_request(metadata: Optional[dict[str, Any]]) -> bool:
+    """True when the gateway marked this send as tool progress and the fold feature is on."""
+    return bool(metadata and metadata.get("feishu_progress_card")) and _folded_progress_enabled()
+
+
+def _trim_progress_body(body: str, limit: int = 6000) -> str:
+    """Keep the newest complete lines of a progress transcript.
+
+    Feishu rejects oversized card payloads, so long transcripts must be trimmed. Trimming by
+    lines (and re-balancing code fences) avoids the broken rendering you get from slicing a
+    fenced block mid-way.
+    """
+    if len(body) <= limit:
+        return body
+    kept = body[-limit:]
+    # Start on a line boundary unless that would lose almost everything.
+    newline = kept.find("\n")
+    if 0 <= newline < len(kept) // 2:
+        kept = kept[newline + 1:]
+    # An odd number of fences means the cut landed inside a code block; drop up to the next one.
+    if kept.count("```") % 2 == 1:
+        fence = kept.find("```")
+        if fence >= 0:
+            kept = kept[fence + 3:]
+    return "…（更早的记录已省略）\n" + kept
+
+
+def _sanitize_card_text(text: str, reply_open_id: Optional[str] = None) -> str:
+    """Rewrite @-mentions into a form Card JSON accepts.
+
+    Card JSON rejects an ``at`` node whose ``user_id`` is Feishu's inbound placeholder
+    (``@_user_N`` / ``@_all``) with 230099 / ErrCode 100290 "invalid user resource", which
+    kills the whole card and silently falls back to a plain message.
+
+    The gateway hands us placeholders, so the first one — normally the person being replied
+    to — is upgraded to a real ``<at id=ou_...>`` node when ``reply_open_id`` is known, which
+    keeps the notification. Any further placeholder degrades to plain ``@名字`` text (we have
+    no id for it, and reusing one open_id would notify the wrong people).
+    """
+    if not text or "<at" not in text:
+        return text
+
+    used_real_id = False
+
+    def _sub(match: re.Match[str]) -> str:
+        nonlocal used_real_id
+        raw_id = match.group(1) or ""
+        label = (match.group(2) or "").strip()
+        if not (raw_id.startswith("@_user_") or raw_id == "@_all"):
+            return match.group(0)  # a real open_id — leave the at node intact
+        if not used_real_id and reply_open_id:
+            used_real_id = True
+            return f"<at id={reply_open_id}></at>"
+        if label:
+            return f"@{label}"
+        return "@所有人" if raw_id == "@_all" else ""
+
+    return _CARD_AT_NODE_RE.sub(_sub, text)
+
+
+def _progress_tool_count(metadata: Optional[dict[str, Any]]) -> int:
+    """Running tool count the gateway attaches to progress sends (0 when absent)."""
+    try:
+        return int((metadata or {}).get("progress_tool_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _progress_reply_open_id(metadata: Optional[dict[str, Any]]) -> Optional[str]:
+    """Open_id of the person this turn replies to, for a real @ node in the card."""
+    value = (metadata or {}).get("reply_open_id")
+    return str(value) if value else None
+
+
+def _build_progress_card(
+    content: str, *, expanded: bool = False, count: int = 0, final_text: Optional[str] = None,
+    reply_open_id: Optional[str] = None,
+) -> dict[str, Any]:
+    """Collapsible tool-progress card, optionally carrying the turn's final answer.
+
+    Collapsed it costs a single line in the chat; the full transcript stays inside the panel
+    and keeps being replaced in place as the turn progresses. Passing ``final_text`` appends
+    the answer below the panel so a whole turn occupies one message.
+    """
+    title = f"🔧 工具调用 ({count})" if count > 0 else "🔧 工具调用"
+    body = _trim_progress_body(_sanitize_card_text(content) or "…")
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "collapsible_panel",
+            "expanded": bool(expanded),
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "vertical_align": "center",
+                "icon": {
+                    "tag": "standard_icon",
+                    "token": "down-small-ccm_outlined",
+                    "color": "",
+                    "size": "16px 16px",
+                },
+                "icon_position": "right",
+                "icon_expanded_angle": -180,
+            },
+            "border": {"color": "grey", "corner_radius": "5px"},
+            "vertical_spacing": "8px",
+            "padding": "8px 8px 8px 8px",
+            "elements": [{"tag": "markdown", "content": body}],
+        }
+    ]
+    if final_text:
+        elements.append({
+            "tag": "markdown",
+            "content": _sanitize_card_text(final_text, reply_open_id),
+        })
+    # Card JSON 2.0: headings, quotes and TABLES only render in the 2.0 structure; the 1.0
+    # shape silently flattens them to plain text.
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "body": {"elements": elements},
+    }
+
+
 def _card_button(label: str, btn_type: str, value: dict[str, Any]) -> dict[str, Any]:
     return {"tag": "button", "text": {"tag": "plain_text", "content": label}, "type": btn_type, "value": value}
 
@@ -1292,6 +1422,12 @@ class FeishuAdapter(BasePlatformAdapter):
     supports_code_blocks = True  # Feishu renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     serial_receive_loop = True  # a chat's next message waits on its lock (_handle_message_with_guards)
+    # Tool progress renders as a collapsed interactive card; the panel hides the length,
+    # so the gateway may keep whole commands instead of truncating to one short line.
+    folded_progress_full_command = True
+    # One card per turn: a text bubble landing below must not split the progress card.
+    progress_card_survives_reset = True
+
     MAX_MESSAGE_LENGTH = 8000
     CHAT_LOCK_MAX_SIZE: int = 1000  # distinct chat IDs kept in _chat_locks before LRU eviction
     _SPLIT_THRESHOLD = 4000  # chunk near Feishu's ~4096-char client split → continuation almost certain
@@ -1346,6 +1482,13 @@ class FeishuAdapter(BasePlatformAdapter):
         self._update_prompt_counter = itertools.count(1)
         # Reaction deletion needs the opaque reaction_id from create, cached per message_id.
         self._pending_processing_reactions: OrderedDict[str, str] = OrderedDict()
+        # Folded tool-progress cards: message_id → update counter, so edits stay in the same card.
+        self._progress_card_counts: OrderedDict[str, int] = OrderedDict()
+        self._PROGRESS_CARD_MAX = 50
+        # chat_id → the live progress card for the current turn, plus its last rendered body,
+        # so the final reply can be folded into the same message instead of a second one.
+        self._progress_card_by_chat: dict[str, str] = {}
+        self._progress_card_bodies: dict[str, str] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1668,6 +1811,36 @@ class FeishuAdapter(BasePlatformAdapter):
         prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
         last_response = None
 
+        # Tool-progress lane: one collapsed card per bubble, later edits replace it in place.
+        if _is_progress_card_request(metadata):
+            try:
+                card_payload = json.dumps(
+                    _build_progress_card(
+                        formatted, count=_progress_tool_count(metadata),
+                        reply_open_id=_progress_reply_open_id(metadata),
+                    ), ensure_ascii=False,
+                )
+                response = await self._feishu_send_with_retry(
+                    chat_id=chat_id,
+                    msg_type="interactive",
+                    payload=card_payload,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                result = self._finalize_send_result(response, "send progress card failed")
+                if result.success:
+                    if result.message_id:
+                        self._remember_progress_card(result.message_id)
+                        self._progress_card_by_chat[chat_id] = result.message_id
+                        self._progress_card_bodies[result.message_id] = formatted
+                    return result
+                logger.warning(
+                    "[Feishu] Progress card rejected (%s); falling back to post/text",
+                    getattr(response, "msg", "") or result.error,
+                )
+            except Exception as exc:
+                logger.warning("[Feishu] Progress card send failed: %s; falling back to post/text", exc)
+
         async def _send_plain(chunk: str) -> Any:
             return await self._feishu_send_with_retry(
                 chat_id=chat_id,
@@ -1703,18 +1876,109 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.error("[Feishu] Send error: %s", exc, exc_info=True)
             return SendResult(success=False, error=str(exc))
 
-    async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+    def _remember_progress_card(self, message_id: str) -> None:
+        """Track a progress-card message so later edits reuse the card instead of text/post."""
+        counts = self._progress_card_counts
+        counts[message_id] = 1
+        counts.move_to_end(message_id)
+        while len(counts) > self._PROGRESS_CARD_MAX:
+            counts.popitem(last=False)
+
+    async def append_final_to_progress_card(
+        self, chat_id: str, text: str, metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Fold the turn's final answer into the live progress card.
+
+        Returns True when the answer was delivered inside the card, so the caller skips a
+        separate final message and the whole turn stays one bubble. False (no live card,
+        oversized payload, or API failure) leaves the caller to send normally.
+        """
+        if not text or not self._client:
+            return False
+        message_id = self._progress_card_by_chat.get(chat_id)
+        if not message_id:
+            return False
+        body = self._progress_card_bodies.get(message_id, "")
+        card = _build_progress_card(
+            body, count=self._progress_card_counts.get(message_id, 0), final_text=text,
+            reply_open_id=_progress_reply_open_id(metadata),
+        )
+        payload = json.dumps(card, ensure_ascii=False)
+        # Feishu caps a card update at 30 KB; fall back to a normal send past that.
+        if len(payload.encode("utf-8")) > 28000:
+            logger.info("[Feishu] final answer too large to fold into the progress card")
+            return False
+        try:
+            request_body = self._build_update_message_body(msg_type=None, content=payload)
+            request = self._build_update_message_request(message_id=message_id, request_body=request_body)
+            patch = getattr(HttpMethod, "PATCH", None)
+            if patch is not None:
+                request.http_method = patch
+            response = await self._run_blocking(self._client.im.v1.message.update, request)
+            return bool(self._finalize_send_result(response, "final append failed").success)
+        except Exception as exc:
+            logger.warning("[Feishu] Folding the final answer into the progress card failed: %s", exc)
+            return False
+        finally:
+            # One turn per card: the next turn starts a fresh one.
+            self.clear_progress_card(chat_id)
+
+    def clear_progress_card(self, chat_id: str) -> None:
+        """Forget the chat's live progress card (turn ended or delivery handled elsewhere)."""
+        message_id = self._progress_card_by_chat.pop(chat_id, None)
+        if message_id:
+            self._progress_card_bodies.pop(message_id, None)
+
+    async def edit_message(
+        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> SendResult:
+        """Edit a previously sent Feishu text/post message (or folded progress card)."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
 
-        async def _update(msg_type: str, payload: str) -> SendResult:
+        async def _update(msg_type: Optional[str], payload: str, *, method: Any = None) -> SendResult:
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
+            if method is not None:
+                # The SDK builds this request as PUT, which Feishu rejects for interactive
+                # cards ("field validation failed"); card updates must go out as PATCH.
+                request.http_method = method
             response = await self._run_blocking(self._client.im.v1.message.update, request)
             return self._finalize_send_result(response, "update failed")
+
+        # Folded progress card: rebuild the collapsible panel and replace it in place. The
+        # metadata marker survives a gateway restart, so an in-flight card keeps updating even
+        # when the in-memory registry is gone.
+        is_progress_card = bool(metadata and metadata.get("feishu_progress_card")) or (
+            message_id in self._progress_card_counts
+        )
+        if is_progress_card:
+            try:
+                card_payload = json.dumps(
+                    _build_progress_card(
+                        content, count=_progress_tool_count(metadata),
+                        reply_open_id=_progress_reply_open_id(metadata),
+                    ), ensure_ascii=False,
+                )
+                result = await _update(None, card_payload, method=getattr(HttpMethod, "PATCH", None))
+                if result.success:
+                    result.message_id = message_id
+                    self._progress_card_bodies[message_id] = content
+                    count = _progress_tool_count(metadata)
+                    if count:
+                        self._progress_card_counts[message_id] = count
+                    self._progress_card_by_chat[chat_id] = message_id
+                    return result
+                # A card cannot be downgraded to text/post in place; report the failure so the
+                # caller keeps the previous card instead of destroying it.
+                logger.warning("[Feishu] Progress card update rejected: %s", result.error)
+                return result
+            except Exception as exc:
+                logger.warning("[Feishu] Progress card update failed: %s", exc)
+                return SendResult(success=False, error=str(exc))
 
         try:
             msg_type, payload = self._build_outbound_payload(content)
@@ -1865,15 +2129,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
     async def send_voice(
         self, chat_id: str, audio_path: str, caption: Optional[str] = None, reply_to: Optional[str] = None,
-        metadata: Optional[dict[str, Any]] = None, is_voice: Optional[bool] = None, **kwargs,
+        metadata: Optional[dict[str, Any]] = None, **kwargs,
     ) -> SendResult:
         """Native voice message (Feishu only accepts Opus): non-opus audio is transcoded via ffmpeg
-        first; without ffmpeg the original file goes out as a file attachment. ``is_voice=False``
-        (an audio MEDIA file without [[audio_as_voice]]: music, a sound effect) is a file
-        attachment under its real name, never transcoded into a voice note."""
-        if is_voice is False:
-            return await self.send_document(
-                chat_id, audio_path, caption=caption, reply_to=reply_to, metadata=metadata)
+        first; without ffmpeg the original file goes out as a file attachment."""
         transcoded_path: Optional[str] = None
         ext = Path(audio_path).suffix.lower()
         if ext not in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
@@ -4012,7 +4271,11 @@ class FeishuAdapter(BasePlatformAdapter):
         return _sdk_build(ReplyMessageRequest, message_id=message_id, request_body=request_body)
 
     @staticmethod
-    def _build_update_message_body(*, msg_type: str, content: str) -> Any:
+    def _build_update_message_body(*, msg_type: Optional[str], content: str) -> Any:
+        # Feishu rejects ``msg_type=interactive`` on update ("invalid msg_type"); omitting the
+        # field is what lets an interactive card be replaced in place.
+        if msg_type is None:
+            return _sdk_build(UpdateMessageRequestBody, content=content)
         return _sdk_build(UpdateMessageRequestBody, msg_type=msg_type, content=content)
 
     @staticmethod
@@ -4062,10 +4325,9 @@ class FeishuAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _resolve_outbound_file_routing(*, file_path: str, requested_message_type: str) -> tuple[str, str]:
-        # Opus only becomes an ``audio`` message (Lark's in-app voice recording) when the caller asked
-        # for one (send_voice with voice intent); a document/plain-audio send of an .ogg stays a file.
+        # requested_message_type is accepted for call-site symmetry; routing is by extension only.
         ext = Path(file_path).suffix.lower()
-        if ext in _FEISHU_OPUS_UPLOAD_EXTENSIONS and requested_message_type == "audio":
+        if ext in _FEISHU_OPUS_UPLOAD_EXTENSIONS:
             return "opus", "audio"
         if ext in _FEISHU_MEDIA_UPLOAD_EXTENSIONS:
             return "mp4", "media"
