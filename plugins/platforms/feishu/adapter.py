@@ -1388,6 +1388,66 @@ def _build_progress_card(
     }
 
 
+def _build_background_tasks_card(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collapsible background-task panel: one row per task with status, exit code and duration.
+
+    Replaces the per-task "✅ Background task finished" chat message on Feishu: the same card is
+    created when a job starts and patched in place as jobs run and finish, so a chat accumulates
+    a single panel instead of one bubble per job.
+    """
+    running = sum(1 for t in tasks if t.get("status") == "running")
+    failed = sum(1 for t in tasks if t.get("status") == "failed")
+    done = sum(1 for t in tasks if t.get("status") == "done")
+    parts = []
+    if running:
+        parts.append(f"{running} 运行中")
+    if failed:
+        parts.append(f"{failed} 失败")
+    if done:
+        parts.append(f"{done} 完成")
+    title = "⚙️ 后台任务" + (f" · {' / '.join(parts)}" if parts else "")
+    lines: list[str] = []
+    for t in tasks[-12:]:
+        status = t.get("status")
+        icon = {"running": "🟢", "done": "✅", "failed": "❌"}.get(status, "⚪")
+        command = _sanitize_card_text(str(t.get("command") or t.get("id") or "?"))
+        meta: list[str] = []
+        if isinstance(t.get("exit_code"), int):
+            meta.append(f"exit {t['exit_code']}")
+        if isinstance(t.get("duration"), (int, float)):
+            meta.append(f"{t['duration']:.0f}s")
+        suffix = f" · {' · '.join(meta)}" if meta else ""
+        lines.append(f"{icon} `{command}`{suffix}")
+    body = "\n".join(lines) or "…"
+    elements: list[dict[str, Any]] = [
+        {
+            "tag": "collapsible_panel",
+            "expanded": bool(running),
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "vertical_align": "center",
+                "icon": {
+                    "tag": "standard_icon",
+                    "token": "down-small-ccm_outlined",
+                    "color": "",
+                    "size": "16px 16px",
+                },
+                "icon_position": "right",
+                "icon_expanded_angle": -180,
+            },
+            "border": {"color": "grey", "corner_radius": "5px"},
+            "vertical_spacing": "8px",
+            "padding": "8px 8px 8px 8px",
+            "elements": [{"tag": "markdown", "content": body}],
+        }
+    ]
+    return {
+        "schema": "2.0",
+        "config": {"wide_screen_mode": True},
+        "body": {"elements": elements},
+    }
+
+
 def _card_button(label: str, btn_type: str, value: dict[str, Any]) -> dict[str, Any]:
     return {"tag": "button", "text": {"tag": "plain_text", "content": label}, "type": btn_type, "value": value}
 
@@ -1489,6 +1549,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # so the final reply can be folded into the same message instead of a second one.
         self._progress_card_by_chat: dict[str, str] = {}
         self._progress_card_bodies: dict[str, str] = {}
+        # Feishu-only: one collapsible background-task card per chat (create-or-patch), so a
+        # finished background job updates that panel instead of sending its own chat message.
+        self._bg_task_card_by_chat: dict[str, str] = {}
+        self._bg_task_card_tasks: dict[str, list[dict[str, Any]]] = OrderedDict()
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1928,6 +1992,51 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id = self._progress_card_by_chat.pop(chat_id, None)
         if message_id:
             self._progress_card_bodies.pop(message_id, None)
+
+    async def update_background_tasks_card(self, chat_id: str, tasks: list[dict[str, Any]]) -> SendResult:
+        """Create-or-patch the chat's single background-task panel.
+
+        Replaces the per-job "✅ Background task finished" bubble: the first task creates the
+        card, later status changes patch it in place. The caller skips its own message once this
+        returns success.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        self._bg_task_card_tasks[chat_id] = list(tasks)
+        try:
+            payload = json.dumps(_build_background_tasks_card(tasks), ensure_ascii=False)
+        except Exception as exc:
+            return SendResult(success=False, error=str(exc))
+        message_id = self._bg_task_card_by_chat.get(chat_id)
+        if message_id:
+            try:
+                request_body = self._build_update_message_body(msg_type=None, content=payload)
+                request = self._build_update_message_request(message_id=message_id, request_body=request_body)
+                patch = getattr(HttpMethod, "PATCH", None)
+                if patch is not None:
+                    request.http_method = patch
+                response = await self._run_blocking(self._client.im.v1.message.update, request)
+                result = self._finalize_send_result(response, "background task card update failed")
+                if result.success:
+                    result.message_id = message_id
+                    return result
+                # Card message deleted or expired — fall through and create a fresh one.
+                logger.info("[Feishu] background task card update failed, recreating: %s", result.error)
+                self._bg_task_card_by_chat.pop(chat_id, None)
+            except Exception as exc:
+                logger.warning("[Feishu] background task card update failed: %s", exc)
+                return SendResult(success=False, error=str(exc))
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id, msg_type="interactive", payload=payload, reply_to=None, metadata=None,
+            )
+            result = self._finalize_send_result(response, "background task card send failed")
+            if result.success and result.message_id:
+                self._bg_task_card_by_chat[chat_id] = result.message_id
+            return result
+        except Exception as exc:
+            logger.warning("[Feishu] background task card send failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
 
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,

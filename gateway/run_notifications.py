@@ -1679,6 +1679,63 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     chat_id, message_text, metadata=_non_conversational_metadata(send_meta, platform=platform_name),
                 )
 
+    async def _deliver_bg_task_card(self, watcher: dict, session) -> bool:
+        """Feishu-only: fold background-task status into the chat's single collapsible panel.
+
+        Returns True when the panel was updated, so the caller skips the per-job chat bubble.
+        Other platforms (and a Feishu adapter without the panel API) return False and keep the
+        existing message path.
+        """
+        platform_name = watcher.get("platform", "")
+        chat_id = watcher.get("chat_id", "")
+        if platform_name != "feishu" or not chat_id:
+            return False
+        try:
+            from tools.process_registry import process_registry
+            from gateway.run import _redact_gateway_user_facing_secrets, _shorten_command_for_display
+
+            source = await asyncio.to_thread(self._build_process_event_source, watcher)
+            adapter = self._resolve_injection_adapter(platform_name, source)
+            updater = getattr(adapter, "update_background_tasks_card", None)
+            if updater is None:
+                return False
+            current_id = getattr(session, "id", "")
+            tasks: list[dict] = []
+            for s in list(process_registry.list_sessions() or []):
+                sid = getattr(s, "id", "")
+                if sid != current_id:
+                    owner_chat = getattr(s, "watcher_chat_id", "")
+                    if owner_chat != chat_id:
+                        continue
+                started = getattr(s, "started_at", 0.0) or 0.0
+                is_exited = bool(getattr(s, "exited", False))
+                ended = getattr(s, "exited_at", 0.0) or 0.0
+                duration = None
+                if started:
+                    duration = max(0.0, (ended if (is_exited and ended) else time.time()) - started)
+                exit_code = getattr(s, "exit_code", None) if is_exited else None
+                if is_exited:
+                    status = "done" if exit_code in (0, None) else "failed"
+                else:
+                    status = "running"
+                command = _shorten_command_for_display(
+                    _redact_gateway_user_facing_secrets(getattr(s, "command", "") or "")
+                )
+                tasks.append({
+                    "id": sid,
+                    "command": command,
+                    "status": status,
+                    "exit_code": exit_code,
+                    "duration": duration,
+                })
+            if not tasks:
+                return False
+            result = await updater(chat_id, tasks[-12:])
+            return bool(getattr(result, "success", False))
+        except Exception:
+            logger.debug("Background task card delivery failed", exc_info=True)
+            return False
+
     @staticmethod
     def _build_process_completion_event(watcher: dict, session, session_id: str) -> dict:
         """Build the synthetic ``completion`` event for an agent-notify watcher."""
@@ -1783,6 +1840,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         last_output_len = 0
         completion_attempts = 0
         retry_interval = interval
+        # Feishu: seed the background-task card on the first poll so a long job shows as running.
+        card_seeded = False
         while True:
             await asyncio.sleep(retry_interval)
             session = process_registry.get(session_id)
@@ -1806,7 +1865,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             current_output_len = len(session.output_buffer)
             has_new_output = current_output_len > last_output_len
             last_output_len = current_output_len
+            # Feishu: seed the panel on the first poll so a long-running job is visible.
+            if not session.exited and platform_name == "feishu" and not card_seeded:
+                card_seeded = await self._deliver_bg_task_card(watcher, session)
             if session.exited:
+                # Feishu: fold the terminal status (exit code + duration) into the panel first;
+                # card_ok then suppresses the separate per-job bubble below.
+                card_ok = await self._deliver_bg_task_card(watcher, session)
                 # Agent-notify: inject a synthetic message unless the agent already consumed the result via
                 # wait/log (poll() is read-only and deliberately does NOT mark consumed).
                 if agent_notify and not process_registry.is_completion_consumed(session_id):
@@ -1823,7 +1888,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                         # receipt. While the launching turn is still running the injection only queues a
                         # follow-up, and the chat would stay mute for as long as that turn lasts
                         # (#112033): send the concise receipt now.
-                        if turn_busy and (notify_mode in {"concise", "all", "result"} or (
+                        if turn_busy and not card_ok and (notify_mode in {"concise", "all", "result"} or (
                             notify_mode == "error" and session.exit_code not in {0, None}
                         )):
                             message_text = self._format_process_final_message(session_id, session, "concise")
@@ -1866,6 +1931,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 if notify_mode in {"concise", "all", "result"} or (
                     notify_mode == "error" and session.exit_code not in {0, None}
                 ):
+                    # Feishu: the panel already carries this completion — skip the per-job bubble.
+                    if card_ok:
+                        break
                     message_text = self._format_process_final_message(session_id, session, notify_mode)
                     from gateway.warning_notifications import present_notification
                     async with self._completion_event_scope(watcher):
