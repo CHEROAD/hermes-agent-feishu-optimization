@@ -1689,6 +1689,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         platform_name = watcher.get("platform", "")
         chat_id = watcher.get("chat_id", "")
         if platform_name != "feishu" or not chat_id:
+            logger.info("[bg-card] skip: platform=%r chat_id=%r", platform_name, chat_id)
             return False
         try:
             from tools.process_registry import process_registry
@@ -1698,6 +1699,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             adapter = self._resolve_injection_adapter(platform_name, source)
             updater = getattr(adapter, "update_background_tasks_card", None)
             if updater is None:
+                logger.info("[bg-card] adapter %r has no update_background_tasks_card", type(adapter).__name__ if adapter else None)
                 return False
             current_id = getattr(session, "id", "")
             tasks: list[dict] = []
@@ -1729,11 +1731,13 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     "duration": duration,
                 })
             if not tasks:
+                logger.info("[bg-card] no tasks matched chat_id=%r (session=%r)", chat_id, current_id)
                 return False
             result = await updater(chat_id, tasks[-12:])
+            logger.info("[bg-card] updated chat=%r tasks=%d success=%s", chat_id, len(tasks[-12:]), getattr(result, "success", None))
             return bool(getattr(result, "success", False))
         except Exception:
-            logger.debug("Background task card delivery failed", exc_info=True)
+            logger.info("[bg-card] delivery failed", exc_info=True)
             return False
 
     @staticmethod
