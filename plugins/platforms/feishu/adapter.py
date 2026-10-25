@@ -2268,15 +2268,15 @@ class FeishuAdapter(BasePlatformAdapter):
         started = time.time()
         try:
             while True:
-                await asyncio.sleep(5)
+                await asyncio.sleep(10)
                 if self._progress_card_by_chat.get(chat_id) != message_id:
                     return
                 idle = time.time() - self._last_progress_at.get(chat_id, started)
-                if idle < 60:
-                    continue
                 if (self._agent_status.get(chat_id) or {}).get("state") == "waiting":
                     # Blocked on the user: not a stall, and no ticking.
                     continue
+                # Fixed cadence so the timer visibly ticks while a long tool or sub-agent runs;
+                # the idle age only changes the wording (60s soft, 180s stall warning).
                 card = _build_progress_card(
                     self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
                     count=self._progress_card_counts.get(message_id, 0),
