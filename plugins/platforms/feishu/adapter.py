@@ -1343,7 +1343,7 @@ def _progress_reply_open_id(metadata: Optional[dict[str, Any]]) -> Optional[str]
 def _build_progress_card(
     content: str, *, expanded: bool = False, count: int = 0, final_text: Optional[str] = None,
     reply_open_id: Optional[str] = None, bg_tasks: Optional[list[dict[str, Any]]] = None,
-    status_label: Optional[str] = None,
+    status_label: Optional[str] = None, subagents: Optional[list[str]] = None,
 ) -> dict[str, Any]:
     """Collapsible tool-progress card, optionally carrying the turn's final answer.
 
@@ -1385,6 +1385,13 @@ def _build_progress_card(
         elements.append({
             "tag": "markdown",
             "content": status_label,
+            "text_align": "left",
+        })
+    if subagents and not final_text:
+        # One row per sub-agent, below the main status.
+        elements.append({
+            "tag": "markdown",
+            "content": "\n".join(subagents),
             "text_align": "left",
         })
     if final_text:
@@ -1580,6 +1587,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # What the agent is doing right now: thinking / tool / waiting. Written by gateway
         # callbacks, read by the heartbeat to age the label and flag a stalled turn.
         self._agent_status: dict[str, dict[str, Any]] = {}
+        # Sub-agents get their own rows under the main status, not the status line itself.
+        self._subagents: dict[str, dict[int, dict[str, Any]]] = {}
+        self._subagent_seq: dict[str, int] = {}
         self._loop: Any = None
         self._load_seen_message_ids()
 
@@ -1918,6 +1928,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         formatted, count=_progress_tool_count(metadata),
                         reply_open_id=_progress_reply_open_id(metadata),
                         bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                        subagents=self._subagent_lines(chat_id),
                         status_label="工具调用中",
                     ), ensure_ascii=False,
                 )
@@ -2006,6 +2017,7 @@ class FeishuAdapter(BasePlatformAdapter):
             body, count=self._progress_card_counts.get(message_id, 0), final_text=text,
             reply_open_id=_progress_reply_open_id(metadata),
             bg_tasks=self._bg_task_card_tasks.get(chat_id),
+            subagents=self._subagent_lines(chat_id),
         )
         payload = json.dumps(card, ensure_ascii=False)
         # Feishu caps a card update at 30 KB; fall back to a normal send past that.
@@ -2084,6 +2096,7 @@ class FeishuAdapter(BasePlatformAdapter):
             count=self._progress_card_counts.get(message_id, 0),
             final_text=self._final_card_text.get(message_id),
             bg_tasks=self._bg_task_card_tasks.get(chat_id),
+            subagents=self._subagent_lines(chat_id),
             status_label=self._status_label(chat_id),
         )
         payload = json.dumps(card, ensure_ascii=False)
@@ -2100,6 +2113,33 @@ class FeishuAdapter(BasePlatformAdapter):
                 self._last_progress_at[chat_id] = time.time()
         except Exception:
             logger.debug("[Feishu] status refresh failed", exc_info=True)
+
+    def note_subagent_start(self, chat_id: str, name: str = "") -> int:
+        """Allocate the next sub-agent row; sub-agents never replace the main status line."""
+        seq = self._subagent_seq.get(chat_id, 0) + 1
+        self._subagent_seq[chat_id] = seq
+        rows = self._subagents.setdefault(chat_id, {})
+        rows[seq] = {"name": name, "state": "运行中"}
+        self._last_progress_at[chat_id] = time.time()
+        self._schedule_status_refresh(chat_id)
+        return seq
+
+    def note_subagent_done(self, chat_id: str, seq: int, state: str = "完成") -> None:
+        rows = self._subagents.get(chat_id)
+        if rows and seq in rows:
+            rows[seq]["state"] = state
+            self._last_progress_at[chat_id] = time.time()
+            self._schedule_status_refresh(chat_id)
+
+    def note_subagent_done_last(self, chat_id: str, state: str = "完成") -> None:
+        """Flip the newest sub-agent row (the gateway's tool-complete has no sequence number)."""
+        rows = self._subagents.get(chat_id) or {}
+        if rows:
+            self.note_subagent_done(chat_id, max(rows), state)
+
+    def _subagent_lines(self, chat_id: str) -> list[str]:
+        rows = self._subagents.get(chat_id) or {}
+        return [f"🤖 sub agent {seq}: {rows[seq].get('state', '')}" for seq in sorted(rows)]
 
     def _status_label(self, chat_id: str, *, idle: float = 0.0) -> str:
         st = self._agent_status.get(chat_id) or {}
@@ -2134,6 +2174,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # A new turn starts with no jobs of its own: drop the previous turn's list so the
         # panel never opens showing stale background tasks.
         self._bg_task_card_tasks.pop(chat_id, None)
+        # Fresh sub-agent numbering for this turn.
+        self._subagents.pop(chat_id, None)
+        self._subagent_seq[chat_id] = 0
         self.note_agent_status(chat_id, "thinking")
         card = _build_progress_card(
             "", count=0, reply_open_id=_progress_reply_open_id(metadata),
@@ -2177,6 +2220,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     count=self._progress_card_counts.get(message_id, 0),
                     final_text=self._final_card_text.get(message_id),
                     bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                    subagents=self._subagent_lines(chat_id),
                     status_label=self._status_label(chat_id, idle=idle),
                 )
                 payload = json.dumps(card, ensure_ascii=False)
@@ -2240,6 +2284,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     count=self._progress_card_counts.get(folded_id, 0),
                     final_text=self._final_card_text.get(folded_id),
                     bg_tasks=tasks,
+                    subagents=self._subagent_lines(chat_id),
                 )
                 folded_payload = json.dumps(card, ensure_ascii=False)
                 # Feishu caps a card update at 30 KB; fall through to a standalone card past that.
@@ -2325,6 +2370,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         content, count=_progress_tool_count(metadata),
                         reply_open_id=_progress_reply_open_id(metadata),
                         bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                        subagents=self._subagent_lines(chat_id),
                         status_label="工具调用中",
                     ), ensure_ascii=False,
                 )

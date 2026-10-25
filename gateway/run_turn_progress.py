@@ -890,11 +890,33 @@ class GatewayTurnProgressMixin:
         except Exception:
             logger.debug("feishu status note failed", exc_info=True)
 
+    def _note_feishu_subagent(self, name: str, *, done: bool) -> None:
+        """Open (or flip) a sub-agent row on the Feishu card — separate from the main status."""
+        try:
+            ctx = self._ctx
+            source = getattr(ctx, "source", None)
+            if source is None or getattr(source, "platform", None) != Platform.FEISHU:
+                return
+            adapter = self._runner._delivery_adapter_for(source)
+            chat_id = getattr(source, "chat_id", None)
+            if not chat_id:
+                return
+            fn = getattr(adapter, "note_subagent_done_last" if done else "note_subagent_start", None)
+            if callable(fn):
+                if done:
+                    fn(chat_id, "已派发")
+                else:
+                    fn(chat_id, name)
+        except Exception:
+            logger.debug("feishu subagent note failed", exc_info=True)
+
     def combined_tool_start_callback(self, call_id, tool_name, args):
         """Compose the voice ack + native task-card start consumers."""
         _tool_name = str(tool_name or "tool")
-        # Delegation runs a whole sub-agent: report it as its own state, not a plain tool.
-        self._note_feishu_status("subagent" if _tool_name in {"delegate_task", "spawn_subagent"} else "tool", _tool_name)
+        # Sub-agents get their own row: they must not overwrite the main status line.
+        if _tool_name in {"delegate_task", "spawn_subagent"}:
+            self._note_feishu_subagent(_tool_name, done=False)
+        self._note_feishu_status("tool", _tool_name)
         if local_viewer_turn(self):
             from gateway import local_viewer_events
             local_viewer_events.note_tool_start(self, call_id, tool_name, args)
@@ -907,6 +929,8 @@ class GatewayTurnProgressMixin:
 
     def combined_tool_complete_callback(self, call_id, tool_name, args, result):
         from agent.display import _detect_tool_failure
+        if str(tool_name or "") in {"delegate_task", "spawn_subagent"}:
+            self._note_feishu_subagent(str(tool_name), done=True)
         self._note_feishu_status("thinking")
         is_error, _ = _detect_tool_failure(tool_name, result)
         owner = self._approval_owner
