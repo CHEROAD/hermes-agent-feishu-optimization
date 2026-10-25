@@ -281,6 +281,7 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                             source.chat_id,
                             reply_to=self._reply_anchor_for_event(event),
                             metadata=_card_meta or None,
+                            internal=bool(getattr(event, "internal", False)),
                         )
                     except Exception:
                         logger.debug("feishu turn card open failed", exc_info=True)

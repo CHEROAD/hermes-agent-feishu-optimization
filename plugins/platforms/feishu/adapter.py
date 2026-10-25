@@ -1603,6 +1603,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._status_refresh_at: dict[str, float] = {}
         # When the last answer landed, so a quick follow-up can be merged into that same card.
         self._final_card_at: dict[str, float] = {}
+        # Whether the current turn came from an internal notice (not a user message): notice
+        # turns fold into the card the user's turn opened instead of starting a new bubble.
+        self._turn_internal: dict[str, bool] = {}
         self._loop: Any = None
         self._load_seen_message_ids()
 
@@ -1928,6 +1931,10 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Tool-progress lane: one collapsed card per bubble, later edits replace it in place.
         if _is_progress_card_request(metadata):
+            if self._turn_internal.get(chat_id):
+                # Notice-driven turn: the card on screen belongs to the user's turn — don't
+                # open another one just to report progress.
+                return SendResult(success=True)
             # The turn card may already exist (opened when the message arrived): patch that
             # bubble instead of stacking a second one on top of it.
             _existing_card = self._progress_card_by_chat.get(chat_id)
@@ -2027,7 +2034,8 @@ class FeishuAdapter(BasePlatformAdapter):
             # No live card. A burst of notification-driven turns should read as one reply, so fold
             # into the answer that just landed instead of opening yet another bubble.
             _prev_id = self._final_card_by_chat.get(chat_id)
-            if not _prev_id or time.time() - self._final_card_at.get(chat_id, 0) > 30:
+            # Only notice-driven turns fold in: a fresh user message is a new turn and a new card.
+            if not _prev_id or not self._turn_internal.get(chat_id):
                 return False
             _prev_text = (self._final_card_text.get(_prev_id) or "").strip()
             _merged = f"{_prev_text}\n\n{text}".strip() if _prev_text else text
@@ -2261,9 +2269,11 @@ class FeishuAdapter(BasePlatformAdapter):
         return f"🧠 思考中 · {elapsed}s"
 
     async def begin_turn_card(self, chat_id: str, reply_to: Optional[str] = None,
-                              metadata: Optional[dict[str, Any]] = None) -> Optional[str]:
+                              metadata: Optional[dict[str, Any]] = None,
+                              internal: bool = False) -> Optional[str]:
         """Open the turn's progress card as soon as the message is accepted, so the chat sees
         activity before (and even without) any tool call."""
+        self._turn_internal[chat_id] = bool(internal)
         try:
             # Remember the gateway loop first: status refreshes from callback threads need it even
             # when this turn reuses an existing bubble.
@@ -2271,6 +2281,9 @@ class FeishuAdapter(BasePlatformAdapter):
         except RuntimeError:
             pass
         if not self._client:
+            return None
+        if internal and self._final_card_by_chat.get(chat_id):
+            # A notice-driven turn: the bubble on screen is the user's, so answer inside it.
             return None
         existing = self._progress_card_by_chat.get(chat_id)
         if existing and self._final_card_by_chat.get(chat_id) == existing:
