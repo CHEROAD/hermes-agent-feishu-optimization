@@ -1354,8 +1354,9 @@ def _build_progress_card(
     title = f"🔧 工具调用 ({count})" if count > 0 else "🔧 工具调用"
     body = _trim_progress_body(_sanitize_card_text(content) or "准备中…")
     elements: list[dict[str, Any]] = []
-    # Nothing has run yet: show the status strip alone instead of an empty tool panel.
-    if count > 0 or (content and content.strip()):
+    # Nothing has run yet: show the status strip alone instead of a tool panel. The panel keys
+    # off the tool count, not the body — a pre-tool "thinking" line is not a tool list.
+    if count > 0:
         elements.append({
             "tag": "collapsible_panel",
             "expanded": bool(expanded),
