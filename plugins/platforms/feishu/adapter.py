@@ -2039,8 +2039,10 @@ class FeishuAdapter(BasePlatformAdapter):
                 return False
             _prev_text = (self._final_card_text.get(_prev_id) or "").strip()
             _merged = f"{_prev_text}\n\n{text}".strip() if _prev_text else text
+            # Keep the original tool rows: an empty body would hide the collapsible panel.
+            _prev_body = self._progress_card_bodies.get(_prev_id, "")
             _card = _build_progress_card(
-                "", count=self._progress_card_counts.get(_prev_id, 0), final_text=_merged,
+                _prev_body, count=self._progress_card_counts.get(_prev_id, 0), final_text=_merged,
                 reply_open_id=_progress_reply_open_id(metadata),
                 bg_tasks=self._bg_task_card_tasks.get(chat_id),
                 subagents=self._subagent_lines(chat_id),
