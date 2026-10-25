@@ -1601,6 +1601,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # Status-refresh throttle: tool events already patch the card, so a state change within
         # the same second doesn't need a second round-trip.
         self._status_refresh_at: dict[str, float] = {}
+        # When the last answer landed, so a quick follow-up can be merged into that same card.
+        self._final_card_at: dict[str, float] = {}
         self._loop: Any = None
         self._load_seen_message_ids()
 
@@ -2022,7 +2024,37 @@ class FeishuAdapter(BasePlatformAdapter):
             return False
         message_id = self._progress_card_by_chat.get(chat_id)
         if not message_id:
-            return False
+            # No live card. A burst of notification-driven turns should read as one reply, so fold
+            # into the answer that just landed instead of opening yet another bubble.
+            _prev_id = self._final_card_by_chat.get(chat_id)
+            if not _prev_id or time.time() - self._final_card_at.get(chat_id, 0) > 30:
+                return False
+            _prev_text = (self._final_card_text.get(_prev_id) or "").strip()
+            _merged = f"{_prev_text}\n\n{text}".strip() if _prev_text else text
+            _card = _build_progress_card(
+                "", count=self._progress_card_counts.get(_prev_id, 0), final_text=_merged,
+                reply_open_id=_progress_reply_open_id(metadata),
+                bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                subagents=self._subagent_lines(chat_id),
+            )
+            _payload = json.dumps(_card, ensure_ascii=False)
+            if len(_payload.encode("utf-8")) > 28000:
+                return False
+            try:
+                _body = self._build_update_message_body(msg_type=None, content=_payload)
+                _req = self._build_update_message_request(message_id=_prev_id, request_body=_body)
+                _patch = getattr(HttpMethod, "PATCH", None)
+                if _patch is not None:
+                    _req.http_method = _patch
+                _resp = await self._run_blocking(self._client.im.v1.message.update, _req)
+                _ok = bool(self._finalize_send_result(_resp, "final merge failed").success)
+                if _ok:
+                    self._final_card_text[_prev_id] = _merged
+                    self._final_card_at[chat_id] = time.time()
+                return _ok
+            except Exception as exc:
+                logger.warning("[Feishu] Merging the answer into the previous card failed: %s", exc)
+                return False
         body = self._progress_card_bodies.get(message_id, "")
         card = _build_progress_card(
             self._decorate_progress_body(chat_id, body), count=self._progress_card_counts.get(message_id, 0), final_text=text,
@@ -2339,6 +2371,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._progress_card_counts.pop(old, None)
             self._final_card_text.pop(old, None)
         self._final_card_by_chat[chat_id] = message_id
+        self._final_card_at[chat_id] = time.time()
 
     async def update_background_tasks_card(self, chat_id: str, tasks: list[dict[str, Any]]) -> SendResult:
         """Fold background-task status into the chat's turn card, between tools and the reply.
