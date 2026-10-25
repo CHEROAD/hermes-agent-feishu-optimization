@@ -921,7 +921,16 @@ class GatewayTurnProgressMixin:
         _tool_name = str(tool_name or "tool")
         # Sub-agents get their own row: they must not overwrite the main status line.
         if _tool_name in {"delegate_task", "spawn_subagent"}:
-            self._note_feishu_subagent(_tool_name, done=False)
+            # One call can fan out to several tasks; give each its own numbered row.
+            _n = 1
+            try:
+                _tasks = (args or {}).get("tasks") if isinstance(args, dict) else None
+                if isinstance(_tasks, list) and _tasks:
+                    _n = len(_tasks)
+            except Exception:
+                _n = 1
+            for _ in range(_n):
+                self._note_feishu_subagent(_tool_name, done=False)
         self._note_feishu_status("tool", _tool_name)
         if local_viewer_turn(self):
             from gateway import local_viewer_events

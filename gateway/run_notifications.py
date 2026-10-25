@@ -1112,7 +1112,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         """Flip the Feishu sub-agent row to 完成 when an async delegation finishes."""
         try:
             adapter = self.adapters.get(Platform.FEISHU)
-            fn = getattr(adapter, "note_subagent_done_last", None)
+            fn = getattr(adapter, "note_all_subagents_done", None)
             if not callable(fn):
                 return
             chat_id = str(evt.get("chat_id") or "").strip()

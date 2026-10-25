@@ -2148,6 +2148,19 @@ class FeishuAdapter(BasePlatformAdapter):
             self._last_progress_at[chat_id] = time.time()
             self._schedule_status_refresh(chat_id)
 
+    def note_all_subagents_done(self, chat_id: str, state: str = "完成") -> None:
+        """Mark every unfinished sub-agent row; one delegation unit can hold several tasks."""
+        rows = self._subagents.get(chat_id)
+        if not rows:
+            return
+        changed = False
+        for row in rows.values():
+            if row.get("state") != state:
+                row["state"] = state
+                changed = True
+        if changed:
+            self._schedule_status_refresh(chat_id)
+
     def note_subagent_done_last(self, chat_id: str, state: str = "完成") -> None:
         """Flip the newest sub-agent row (the gateway's tool-complete has no sequence number)."""
         rows = self._subagents.get(chat_id) or {}
