@@ -1562,6 +1562,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # bubble (tools → jobs → reply) instead of appending a new message below the reply.
         self._final_card_by_chat: dict[str, str] = {}
         self._final_card_text: dict[str, str] = {}
+        # Job ids already shown in a previous turn: a new turn's panel starts empty instead of
+        # re-listing every finished job of the conversation.
+        self._bg_seen_ids: dict[str, set[str]] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -2012,6 +2015,10 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id = self._progress_card_by_chat.pop(chat_id, None)
         if not message_id:
             return
+        # Jobs shown in this turn stay hidden in the next turn's panel.
+        self._bg_seen_ids[chat_id] = {
+            t.get("id", "") for t in self._bg_task_card_tasks.get(chat_id, []) if t.get("id")
+        }
         old = self._final_card_by_chat.get(chat_id)
         if old and old != message_id:
             self._progress_card_bodies.pop(old, None)
@@ -2027,7 +2034,13 @@ class FeishuAdapter(BasePlatformAdapter):
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
+        # Only this turn's jobs: anything already shown in an earlier turn stays hidden
+        # unless it is still running.
+        seen = self._bg_seen_ids.get(chat_id, set())
+        tasks = [t for t in tasks if t.get("status") == "running" or t.get("id") not in seen]
         self._bg_task_card_tasks[chat_id] = list(tasks)
+        if not tasks and not (self._progress_card_by_chat.get(chat_id) or self._final_card_by_chat.get(chat_id)):
+            return SendResult(success=True)
         try:
             folded_id = self._progress_card_by_chat.get(chat_id) or self._final_card_by_chat.get(chat_id)
             if folded_id and (folded_id in self._progress_card_bodies or folded_id in self._final_card_text):
