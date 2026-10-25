@@ -2204,13 +2204,22 @@ class FeishuAdapter(BasePlatformAdapter):
                               metadata: Optional[dict[str, Any]] = None) -> Optional[str]:
         """Open the turn's progress card as soon as the message is accepted, so the chat sees
         activity before (and even without) any tool call."""
-        if not self._client or chat_id in self._progress_card_by_chat:
-            return None
         try:
-            # Remember the gateway loop so callback threads can schedule card patches.
+            # Remember the gateway loop first: status refreshes from callback threads need it even
+            # when this turn reuses an existing bubble.
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
             pass
+        if not self._client:
+            return None
+        existing = self._progress_card_by_chat.get(chat_id)
+        if existing and self._final_card_by_chat.get(chat_id) == existing:
+            # A retired card left behind by an abnormal end: this is a new turn, so open a fresh one.
+            self._progress_card_by_chat.pop(chat_id, None)
+            self._progress_card_bodies.pop(existing, None)
+            existing = None
+        if existing:
+            return None
         # A new turn starts with no jobs of its own: drop the previous turn's list so the
         # panel never opens showing stale background tasks.
         self._bg_task_card_tasks.pop(chat_id, None)
