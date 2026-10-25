@@ -1343,6 +1343,7 @@ def _progress_reply_open_id(metadata: Optional[dict[str, Any]]) -> Optional[str]
 def _build_progress_card(
     content: str, *, expanded: bool = False, count: int = 0, final_text: Optional[str] = None,
     reply_open_id: Optional[str] = None, bg_tasks: Optional[list[dict[str, Any]]] = None,
+    status_label: Optional[str] = None,
 ) -> dict[str, Any]:
     """Collapsible tool-progress card, optionally carrying the turn's final answer.
 
@@ -1351,6 +1352,8 @@ def _build_progress_card(
     the answer below the panel so a whole turn occupies one message.
     """
     title = f"🔧 工具调用 ({count})" if count > 0 else "🔧 工具调用"
+    if status_label:
+        title = f"{title} · {status_label}"
     body = _trim_progress_body(_sanitize_card_text(content) or "…")
     elements: list[dict[str, Any]] = [
         {
@@ -1565,6 +1568,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # Job ids already shown in a previous turn: a new turn's panel starts empty instead of
         # re-listing every finished job of the conversation.
         self._bg_seen_ids: dict[str, set[str]] = {}
+        # Heartbeat: keep the progress card ticking so a long think/tool run never looks dead.
+        self._heartbeat_tasks: dict[str, Any] = {}
+        self._last_progress_at: dict[str, float] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1910,6 +1916,8 @@ class FeishuAdapter(BasePlatformAdapter):
                         self._remember_progress_card(result.message_id)
                         self._progress_card_by_chat[chat_id] = result.message_id
                         self._progress_card_bodies[result.message_id] = formatted
+                        self._last_progress_at[chat_id] = time.time()
+                        self._start_progress_heartbeat(chat_id, result.message_id)
                     return result
                 logger.warning(
                     "[Feishu] Progress card rejected (%s); falling back to post/text",
@@ -2006,12 +2014,67 @@ class FeishuAdapter(BasePlatformAdapter):
             # One turn per card: the next turn starts a fresh one.
             self.clear_progress_card(chat_id)
 
+    def _start_progress_heartbeat(self, chat_id: str, message_id: str) -> None:
+        """Tick the progress card every 10s so a long think or tool run never looks stuck."""
+        task = self._heartbeat_tasks.get(chat_id)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._heartbeat_tasks[chat_id] = loop.create_task(
+            self._progress_heartbeat_loop(chat_id, message_id)
+        )
+
+    def _stop_progress_heartbeat(self, chat_id: str) -> None:
+        task = self._heartbeat_tasks.pop(chat_id, None)
+        self._last_progress_at.pop(chat_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _progress_heartbeat_loop(self, chat_id: str, message_id: str) -> None:
+        started = time.time()
+        try:
+            while True:
+                await asyncio.sleep(10)
+                if self._progress_card_by_chat.get(chat_id) != message_id:
+                    return
+                elapsed = int(time.time() - started)
+                idle = time.time() - self._last_progress_at.get(chat_id, started)
+                # A tool that reported within the last 8s means one is running; otherwise the
+                # model is generating. Either way the counter proves the agent is still alive.
+                label = f"工具调用中 · {elapsed}s" if idle < 8 else f"思考中 · {elapsed}s"
+                card = _build_progress_card(
+                    self._progress_card_bodies.get(message_id, ""),
+                    count=self._progress_card_counts.get(message_id, 0),
+                    final_text=self._final_card_text.get(message_id),
+                    bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                    status_label=label,
+                )
+                payload = json.dumps(card, ensure_ascii=False)
+                if len(payload.encode("utf-8")) > 28000:
+                    return
+                request_body = self._build_update_message_body(msg_type=None, content=payload)
+                request = self._build_update_message_request(message_id=message_id, request_body=request_body)
+                patch = getattr(HttpMethod, "PATCH", None)
+                if patch is not None:
+                    request.http_method = patch
+                response = await self._run_blocking(self._client.im.v1.message.update, request)
+                if not self._finalize_send_result(response, "heartbeat update failed").success:
+                    return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("[Feishu] progress heartbeat stopped", exc_info=True)
+
     def clear_progress_card(self, chat_id: str) -> None:
         """Retire the chat's live progress card but keep it as the turn's final bubble.
 
         Background-task updates later patch this same card, so the order stays
         tools → background jobs → reply instead of appending a new message below the answer.
         """
+        self._stop_progress_heartbeat(chat_id)
         message_id = self._progress_card_by_chat.pop(chat_id, None)
         if not message_id:
             return
@@ -2140,6 +2203,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 if result.success:
                     result.message_id = message_id
                     self._progress_card_bodies[message_id] = content
+                    self._last_progress_at[chat_id] = time.time()
                     count = _progress_tool_count(metadata)
                     if count:
                         self._progress_card_counts[message_id] = count
