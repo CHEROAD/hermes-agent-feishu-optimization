@@ -615,7 +615,13 @@ class GatewayTurnProgressMixin:
         if not meta:
             return meta
         merged = dict(meta)
-        merged["progress_tool_count"] = len(st.progress_lines)
+        # Thinking scratch lines (💬 …) are not tool calls: count only real tool rows, else a
+        # turn that only thinks reports "工具调用 (1)" with an empty panel.
+        thinking_prefix = t("gateway.progress.thinking_prefix", text="").strip()
+        merged["progress_tool_count"] = sum(
+            1 for line in st.progress_lines
+            if not (isinstance(line, str) and thinking_prefix and line.startswith(thinking_prefix))
+        )
         return merged
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
