@@ -2381,67 +2381,77 @@ class FeishuAdapter(BasePlatformAdapter):
         card_id = self._card_id_by_chat.get(chat_id)
         if not card_id or not self._client:
             return False
-        with _CARD_LOCK:
-            seq = self._card_seq.get(chat_id, 0) + 1
-            self._card_seq[chat_id] = seq
-        try:
-            from lark_oapi.api.cardkit.v1 import PatchCardElementRequest, PatchCardElementRequestBody
-            body = (
-                PatchCardElementRequestBody.builder()
-                .partial_element(json.dumps(partial, ensure_ascii=False))
-                .sequence(seq)
-                .build()
-            )
-            request = (
-                PatchCardElementRequest.builder()
-                .card_id(card_id)
-                .element_id(element_id)
-                .request_body(body)
-                .build()
-            )
-            response = await self._run_blocking(self._client.cardkit.v1.card_element.patch, request)
-            if not getattr(response, "success", lambda: False)():
-                logger.info("[Feishu] cardkit patch %s failed: %s", element_id, getattr(response, "msg", ""))
+        from lark_oapi.api.cardkit.v1 import PatchCardElementRequest, PatchCardElementRequestBody
+        # Two attempts: when two updates race, the later sequence can land first and the
+        # earlier one gets rejected — retrying with a fresh, larger sequence settles it.
+        for _attempt in range(2):
+            with _CARD_LOCK:
+                seq = self._card_seq.get(chat_id, 0) + 1
+                self._card_seq[chat_id] = seq
+            try:
+                body = (
+                    PatchCardElementRequestBody.builder()
+                    .partial_element(json.dumps(partial, ensure_ascii=False))
+                    .sequence(seq)
+                    .build()
+                )
+                request = (
+                    PatchCardElementRequest.builder()
+                    .card_id(card_id)
+                    .element_id(element_id)
+                    .request_body(body)
+                    .build()
+                )
+                response = await self._run_blocking(self._client.cardkit.v1.card_element.patch, request)
+                if getattr(response, "success", lambda: False)():
+                    self._last_card_update_at[chat_id] = time.time()
+                    return True
+                msg = str(getattr(response, "msg", ""))
+                logger.info("[Feishu] cardkit patch %s failed: %s", element_id, msg)
+                if "sequence" not in msg:
+                    return False
+            except Exception:
+                logger.debug("[Feishu] cardkit patch error", exc_info=True)
                 return False
-            self._card_seq[chat_id] = seq
-            self._last_card_update_at[chat_id] = time.time()
-            return True
-        except Exception:
-            logger.debug("[Feishu] cardkit patch error", exc_info=True)
-            return False
+        return False
+
 
     async def _cardkit_update_card(self, chat_id: str, card: dict[str, Any]) -> bool:
         """Replace the whole card entity (the layout is dynamic: panels come and go)."""
         card_id = self._card_id_by_chat.get(chat_id)
         if not card_id or not self._client:
             return False
-        with _CARD_LOCK:
-            seq = self._card_seq.get(chat_id, 0) + 1
-            self._card_seq[chat_id] = seq
-        try:
-            from lark_oapi.api.cardkit.v1 import Card, UpdateCardRequest, UpdateCardRequestBody
-            body = (
-                UpdateCardRequestBody.builder()
-                .card(
-                    Card.builder()
-                    .type("card_json")
-                    .data(json.dumps(card, ensure_ascii=False))
+        from lark_oapi.api.cardkit.v1 import Card, UpdateCardRequest, UpdateCardRequestBody
+        for _attempt in range(2):
+            with _CARD_LOCK:
+                seq = self._card_seq.get(chat_id, 0) + 1
+                self._card_seq[chat_id] = seq
+            try:
+                body = (
+                    UpdateCardRequestBody.builder()
+                    .card(
+                        Card.builder()
+                        .type("card_json")
+                        .data(json.dumps(card, ensure_ascii=False))
+                        .build()
+                    )
+                    .sequence(seq)
                     .build()
                 )
-                .sequence(seq)
-                .build()
-            )
-            request = UpdateCardRequest.builder().card_id(card_id).request_body(body).build()
-            response = await self._run_blocking(self._client.cardkit.v1.card.update, request)
-            if not getattr(response, "success", lambda: False)():
-                logger.info("[Feishu] cardkit update failed: %s", getattr(response, "msg", ""))
+                request = UpdateCardRequest.builder().card_id(card_id).request_body(body).build()
+                response = await self._run_blocking(self._client.cardkit.v1.card.update, request)
+                if getattr(response, "success", lambda: False)():
+                    self._last_card_update_at[chat_id] = time.time()
+                    return True
+                msg = str(getattr(response, "msg", ""))
+                logger.info("[Feishu] cardkit update failed: %s", msg)
+                if "sequence" not in msg:
+                    return False
+            except Exception:
+                logger.debug("[Feishu] cardkit update error", exc_info=True)
                 return False
-            self._card_seq[chat_id] = seq
-            self._last_card_update_at[chat_id] = time.time()
-            return True
-        except Exception:
-            logger.debug("[Feishu] cardkit update error", exc_info=True)
-            return False
+        return False
+
 
     async def begin_turn_card(self, chat_id: str, reply_to: Optional[str] = None,
                               metadata: Optional[dict[str, Any]] = None,
