@@ -568,6 +568,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             return ask_clarify_batch(self, questions)
         answers: dict[str, Any] = {}
         reply: dict[str, Any] = {"answers": answers, "outcome": "submitted"}
+        self._note_feishu_waiting()
         last = len(questions) - 1
         # The typed-"skip" hint is for messaging adapters, where a chat reply answers the card. A local
         # viewer (TUI / Desktop / CLI) renders main's modal with its own skip control, unhinted.
@@ -674,7 +675,22 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
                 logger.debug("resume_typing_for_chat after clarify answer failed", exc_info=True)
         return response, answered
 
+    def _note_feishu_waiting(self) -> None:
+        """The agent is blocked on the user (approval / clarify): show it, and stop ticking."""
+        try:
+            ctx = self._ctx
+            source = getattr(ctx, "source", None)
+            if source is None or getattr(source, "platform", None) != Platform.FEISHU:
+                return
+            fn = getattr(ctx._status_adapter, "note_agent_status", None)
+            chat_id = getattr(ctx, "_status_chat_id", None)
+            if callable(fn) and chat_id:
+                fn(chat_id, "waiting")
+        except Exception:
+            logger.debug("feishu waiting status failed", exc_info=True)
+
     def _approval_notify_sync(self, approval_data: dict) -> None:
+        self._note_feishu_waiting()
         if self._approval_owner is not None:
             authority, session_id, generation = self._approval_owner
             authority.check_approval_generation(session_id, generation)

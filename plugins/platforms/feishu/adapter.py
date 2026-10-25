@@ -1580,6 +1580,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # What the agent is doing right now: thinking / tool / waiting. Written by gateway
         # callbacks, read by the heartbeat to age the label and flag a stalled turn.
         self._agent_status: dict[str, dict[str, Any]] = {}
+        self._loop: Any = None
         self._load_seen_message_ids()
 
     @staticmethod
@@ -2053,12 +2054,52 @@ class FeishuAdapter(BasePlatformAdapter):
     def note_agent_status(self, chat_id: str, state: str, detail: Optional[str] = None) -> None:
         """Record what the agent is doing and stamp activity (called from gateway callbacks).
 
-        state: ``thinking`` (model generating), ``tool`` (waiting on a tool), ``waiting``
-        (blocked on the user, so the heartbeat must not tick).
+        state: ``thinking`` (model generating), ``tool`` (waiting on a tool), ``subagent``
+        (delegation running), ``waiting`` (blocked on the user, so the heartbeat must not tick).
+        A change of state patches the card right away — the timer is only the stall fallback.
         """
         now = time.time()
+        prev = self._agent_status.get(chat_id) or {}
         self._agent_status[chat_id] = {"state": state, "detail": detail, "since": now}
         self._last_progress_at[chat_id] = now
+        if (prev.get("state"), prev.get("detail")) != (state, detail):
+            self._schedule_status_refresh(chat_id)
+
+    def _schedule_status_refresh(self, chat_id: str) -> None:
+        """Patch the status strip from a callback thread (agent thread has no running loop)."""
+        loop = getattr(self, "_loop", None)
+        if loop is None or loop.is_closed():
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(self._refresh_status_card(chat_id), loop)
+        except Exception:
+            logger.debug("[Feishu] status refresh schedule failed", exc_info=True)
+
+    async def _refresh_status_card(self, chat_id: str) -> None:
+        message_id = self._progress_card_by_chat.get(chat_id)
+        if not message_id or not self._client:
+            return
+        card = _build_progress_card(
+            self._progress_card_bodies.get(message_id, ""),
+            count=self._progress_card_counts.get(message_id, 0),
+            final_text=self._final_card_text.get(message_id),
+            bg_tasks=self._bg_task_card_tasks.get(chat_id),
+            status_label=self._status_label(chat_id),
+        )
+        payload = json.dumps(card, ensure_ascii=False)
+        if len(payload.encode("utf-8")) > 28000:
+            return
+        try:
+            request_body = self._build_update_message_body(msg_type=None, content=payload)
+            request = self._build_update_message_request(message_id=message_id, request_body=request_body)
+            patch = getattr(HttpMethod, "PATCH", None)
+            if patch is not None:
+                request.http_method = patch
+            response = await self._run_blocking(self._client.im.v1.message.update, request)
+            if self._finalize_send_result(response, "status refresh failed").success:
+                self._last_progress_at[chat_id] = time.time()
+        except Exception:
+            logger.debug("[Feishu] status refresh failed", exc_info=True)
 
     def _status_label(self, chat_id: str, *, idle: float = 0.0) -> str:
         st = self._agent_status.get(chat_id) or {}
@@ -2067,6 +2108,9 @@ class FeishuAdapter(BasePlatformAdapter):
         elapsed = int(time.time() - (st.get("since") or time.time()))
         if state == "waiting":
             return "⏳ 等你确认"
+        if state == "subagent":
+            head = f"🤖 子代理中 · {detail}" if detail else "🤖 子代理中"
+            return f"{head} · {elapsed}s"
         if state == "tool":
             head = f"🔧 工具调用中 · {detail}" if detail else "🔧 工具调用中"
             return f"{head} · {elapsed}s"
@@ -2082,6 +2126,11 @@ class FeishuAdapter(BasePlatformAdapter):
         activity before (and even without) any tool call."""
         if not self._client or chat_id in self._progress_card_by_chat:
             return None
+        try:
+            # Remember the gateway loop so callback threads can schedule card patches.
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
         # A new turn starts with no jobs of its own: drop the previous turn's list so the
         # panel never opens showing stale background tasks.
         self._bg_task_card_tasks.pop(chat_id, None)

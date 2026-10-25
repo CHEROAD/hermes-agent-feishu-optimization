@@ -892,7 +892,9 @@ class GatewayTurnProgressMixin:
 
     def combined_tool_start_callback(self, call_id, tool_name, args):
         """Compose the voice ack + native task-card start consumers."""
-        self._note_feishu_status("tool", str(tool_name or "tool"))
+        _tool_name = str(tool_name or "tool")
+        # Delegation runs a whole sub-agent: report it as its own state, not a plain tool.
+        self._note_feishu_status("subagent" if _tool_name in {"delegate_task", "spawn_subagent"} else "tool", _tool_name)
         if local_viewer_turn(self):
             from gateway import local_viewer_events
             local_viewer_events.note_tool_start(self, call_id, tool_name, args)
