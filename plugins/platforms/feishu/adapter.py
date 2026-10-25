@@ -1353,8 +1353,10 @@ def _build_progress_card(
     """
     title = f"🔧 工具调用 ({count})" if count > 0 else "🔧 工具调用"
     body = _trim_progress_body(_sanitize_card_text(content) or "准备中…")
-    elements: list[dict[str, Any]] = [
-        {
+    elements: list[dict[str, Any]] = []
+    # Nothing has run yet: show the status strip alone instead of an empty tool panel.
+    if count > 0 or (content and content.strip()):
+        elements.append({
             "tag": "collapsible_panel",
             "expanded": bool(expanded),
             "header": {
@@ -1373,15 +1375,15 @@ def _build_progress_card(
             "vertical_spacing": "8px",
             "padding": "8px 8px 8px 8px",
             "elements": [{"tag": "markdown", "content": body}],
-        }
-    ]
+        })
     if bg_tasks:
         # Sits between the tool panel and the final answer, so a turn reads top-down:
         # tools → background jobs → reply.
         elements.append(_bg_panel_element(bg_tasks))
     if status_label and not final_text:
         # Its own strip at the bottom of the card: tools → background jobs → live status.
-        elements.append({"tag": "hr"})
+        if elements:
+            elements.append({"tag": "hr"})
         elements.append({
             "tag": "markdown",
             "content": status_label,
