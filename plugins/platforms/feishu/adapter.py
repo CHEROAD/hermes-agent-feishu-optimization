@@ -2216,11 +2216,6 @@ class FeishuAdapter(BasePlatformAdapter):
                     await self._cardkit_patch_element(
                         chat_id, "subagents", {"content": "\n".join(self._subagent_lines(chat_id))},
                     )
-                _elapsed = self._turn_elapsed(chat_id)
-                if _elapsed is not None:
-                    await self._cardkit_patch_element(
-                        chat_id, "footer", {"content": f"⏱ 总耗时 {_fmt_elapsed(_elapsed)}"},
-                    )
                 self._last_progress_at[chat_id] = time.time()
                 return
         except Exception:
@@ -2526,22 +2521,9 @@ class FeishuAdapter(BasePlatformAdapter):
                 if time.time() - self._last_card_update_at.get(chat_id, started) < 10:
                     continue
                 idle = time.time() - self._last_progress_at.get(chat_id, started)
-                # Cheap path: only the status strip (and sub-agent rows) changed, so patch those
-                # elements instead of resending the whole card.
+                # One full update per idle window: the card regenerates status + footer together,
+                # which avoids depending on element ids surviving a PUT.
                 _label = self._status_label(chat_id, idle=idle)
-                if await self._cardkit_patch_element(chat_id, "status", {"content": _label}):
-                    if self._subagents.get(chat_id):
-                        await self._cardkit_patch_element(
-                            chat_id, "subagents",
-                            {"content": "\n".join(self._subagent_lines(chat_id))},
-                        )
-                    _elapsed = self._turn_elapsed(chat_id)
-                    if _elapsed is not None:
-                        await self._cardkit_patch_element(
-                            chat_id, "footer", {"content": f"⏱ 总耗时 {_fmt_elapsed(_elapsed)}"},
-                        )
-                    self._last_progress_at[chat_id] = time.time()
-                    continue
                 card = _build_progress_card(
                     self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
                     count=self._progress_card_counts.get(message_id, 0),
