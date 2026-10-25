@@ -1648,8 +1648,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # not the message id, and every operation must carry a strictly increasing sequence.
         self._card_id_by_chat = _CARD_IDS
         self._card_seq = _CARD_SEQ
-        # Start of the turn currently owning this chat's card, for the footer duration.
+        # Start/end of the turn currently owning this chat's card, for the footer duration.
         self._turn_started_at: dict[str, float] = {}
+        self._turn_ended_at: dict[str, float] = {}
         # Last time the card content actually changed: the heartbeat is a 10s fallback only.
         self._last_card_update_at: dict[str, float] = {}
         self._loop: Any = None
@@ -2320,9 +2321,13 @@ class FeishuAdapter(BasePlatformAdapter):
         return "\n".join(out)
 
     def _turn_elapsed(self, chat_id: str) -> Optional[float]:
-        """Seconds since this turn's card was opened (None when no turn is tracked)."""
+        """Seconds this turn ran (frozen once the answer landed), else None."""
         started = self._turn_started_at.get(chat_id)
-        return (time.time() - started) if started else None
+        if not started:
+            return None
+        # A finished turn keeps its final duration: a late background-task patch must not
+        # report the wall-clock time since the turn ended.
+        return self._turn_ended_at.get(chat_id, time.time()) - started
 
     def _status_label(self, chat_id: str, *, idle: float = 0.0) -> str:
         st = self._agent_status.get(chat_id) or {}
@@ -2447,6 +2452,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # A notice-driven turn inherits the running clock of the user's turn.
         if not internal or chat_id not in self._turn_started_at:
             self._turn_started_at[chat_id] = time.time()
+            self._turn_ended_at.pop(chat_id, None)
         try:
             # Remember the gateway loop first: status refreshes from callback threads need it even
             # when this turn reuses an existing bubble.
@@ -2477,6 +2483,7 @@ class FeishuAdapter(BasePlatformAdapter):
         card = _build_progress_card(
             "", count=0, reply_open_id=_progress_reply_open_id(metadata),
             status_label=self._status_label(chat_id),
+            elapsed_s=self._turn_elapsed(chat_id),
         )
         payload = json.dumps(card, ensure_ascii=False)
         try:
@@ -2495,6 +2502,9 @@ class FeishuAdapter(BasePlatformAdapter):
             if _card_id:
                 self._card_id_by_chat[chat_id] = _card_id
                 self._card_seq[chat_id] = 0
+            else:
+                # No entity this turn: drop the stale id so updates can't land on last turn's card.
+                self._card_id_by_chat.pop(chat_id, None)
             self._remember_progress_card(result.message_id)
             self._progress_card_by_chat[chat_id] = result.message_id
             self._progress_card_bodies[result.message_id] = ""
@@ -2571,6 +2581,7 @@ class FeishuAdapter(BasePlatformAdapter):
             self._final_card_text.pop(old, None)
         self._final_card_by_chat[chat_id] = message_id
         self._final_card_at[chat_id] = time.time()
+        self._turn_ended_at[chat_id] = time.time()
 
     async def update_background_tasks_card(self, chat_id: str, tasks: list[dict[str, Any]]) -> SendResult:
         """Fold background-task status into the chat's turn card, between tools and the reply.
@@ -2623,37 +2634,6 @@ class FeishuAdapter(BasePlatformAdapter):
         except Exception as exc:
             logger.warning("[Feishu] background task card build failed: %s", exc)
             return SendResult(success=False, error=str(exc))
-        message_id = self._bg_task_card_by_chat.get(chat_id)
-        if message_id:
-            try:
-                request_body = self._build_update_message_body(msg_type=None, content=payload)
-                request = self._build_update_message_request(message_id=message_id, request_body=request_body)
-                patch = getattr(HttpMethod, "PATCH", None)
-                if patch is not None:
-                    request.http_method = patch
-                response = await self._run_blocking(self._client.im.v1.message.update, request)
-                result = self._finalize_send_result(response, "background task card update failed")
-                if result.success:
-                    result.message_id = message_id
-                    return result
-                # Card message deleted or expired — fall through and create a fresh one.
-                logger.info("[Feishu] background task card update failed, recreating: %s", result.error)
-                self._bg_task_card_by_chat.pop(chat_id, None)
-            except Exception as exc:
-                logger.warning("[Feishu] background task card update failed: %s", exc)
-                return SendResult(success=False, error=str(exc))
-        try:
-            response = await self._feishu_send_with_retry(
-                chat_id=chat_id, msg_type="interactive", payload=payload, reply_to=None, metadata=None,
-            )
-            result = self._finalize_send_result(response, "background task card send failed")
-            if result.success and result.message_id:
-                self._bg_task_card_by_chat[chat_id] = result.message_id
-            return result
-        except Exception as exc:
-            logger.warning("[Feishu] background task card send failed: %s", exc)
-            return SendResult(success=False, error=str(exc))
-
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
         metadata: Optional[dict[str, Any]] = None,
