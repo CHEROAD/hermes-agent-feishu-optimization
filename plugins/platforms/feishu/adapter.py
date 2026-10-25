@@ -2146,8 +2146,8 @@ class FeishuAdapter(BasePlatformAdapter):
         for seq in sorted(rows):
             row = rows[seq]
             state = row.get("state", "")
-            # Running sub-agents tick like the main status; finished ones show the state only.
-            suffix = f" · {int(now - row.get('since', now))}s" if state == "运行中" else ""
+            # Running rows tick like the main status; a finished one shows the state only.
+            suffix = f" · {int(now - row.get('since', now))}s" if state in {"运行中", "后台运行中"} else ""
             out.append(f"🤖 sub agent {seq}: {state}{suffix}")
         return out
 

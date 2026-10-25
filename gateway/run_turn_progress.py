@@ -904,7 +904,7 @@ class GatewayTurnProgressMixin:
             fn = getattr(adapter, "note_subagent_done_last" if done else "note_subagent_start", None)
             if callable(fn):
                 if done:
-                    fn(chat_id, "已派发")
+                    fn(chat_id, "后台运行中")
                 else:
                     fn(chat_id, name)
         except Exception:
