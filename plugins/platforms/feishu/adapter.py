@@ -2564,6 +2564,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 if not self._finalize_send_result(response, "heartbeat update failed").success:
                     return
                 self._last_progress_at[chat_id] = time.time()
+                self._last_card_update_at[chat_id] = time.time()
         except asyncio.CancelledError:
             raise
         except Exception:
