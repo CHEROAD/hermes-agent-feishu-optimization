@@ -361,6 +361,27 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+            # Feishu opens the turn card when the message arrives. A turn can then end without
+            # ever delivering an answer — a newer run superseded it, the gateway drained for a
+            # restart, the agent raised — and that card would keep its spinner for good, which
+            # reads in chat as "stuck, no reply". Close it only when NOTHING went out this turn.
+            try:
+                _result = locals().get("agent_result")
+                _out = locals().get("response")
+                _delivered = bool(
+                    (isinstance(_out, str) and _out.strip())
+                    or (isinstance(_result, dict) and _result.get("already_sent"))
+                    # A muted notice turn is deliberately silent — not a dropped answer.
+                    or locals().get("_intentional_silence")
+                )
+                if (not _delivered and source.platform == Platform.FEISHU
+                        and getattr(source, "chat_id", None)):
+                    _fc_adapter = self._delivery_adapter_for(source)
+                    _abandon = getattr(_fc_adapter, "abandon_progress_card", None)
+                    if callable(_abandon):
+                        await _abandon(source.chat_id)
+            except Exception:
+                logger.debug("feishu abandoned turn card cleanup failed", exc_info=True)
 
     def _profile_scope_for_source(self, source: SessionSource):
         """``_profile_runtime_scope`` for ``source``'s profile when a secret scope is required.

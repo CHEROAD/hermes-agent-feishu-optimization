@@ -2156,6 +2156,36 @@ class FeishuAdapter(BasePlatformAdapter):
             # One turn per card: the next turn starts a fresh one.
             self.clear_progress_card(chat_id)
 
+    async def abandon_progress_card(self, chat_id: str, note: str = "") -> None:
+        """Close a live turn card that will never receive an answer.
+
+        A turn can end without any final message: a newer run superseded this one, the gateway
+        drained for a restart, or the agent raised before producing text. Left alone the card
+        keeps its last ``思考中 / 工具调用中`` strip forever and the chat reads as stuck — and the
+        next turn reuses that same bubble. Patch a terminal strip plus a short note, then retire
+        the card exactly like a finished turn.
+        """
+        message_id = self._progress_card_by_chat.get(chat_id)
+        if not message_id:
+            return
+        text = note or "⚠️ 本轮没有产出结果（被重启或新消息打断），请重发一次。"
+        self._turn_ended_at.setdefault(chat_id, time.time())
+        try:
+            card = _build_progress_card(
+                self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
+                count=self._progress_card_counts.get(message_id, 0),
+                final_text=text,
+                bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                subagents=self._subagent_lines(chat_id),
+                elapsed_s=self._turn_elapsed(chat_id),
+            )
+            if await self._cardkit_update_card(chat_id, card):
+                self._final_card_text[message_id] = text
+        except Exception:
+            logger.debug("[Feishu] closing an abandoned turn card failed", exc_info=True)
+        finally:
+            self.clear_progress_card(chat_id)
+
     def _start_progress_heartbeat(self, chat_id: str, message_id: str) -> None:
         """Tick the progress card every 10s so a long think or tool run never looks stuck."""
         task = self._heartbeat_tasks.get(chat_id)
