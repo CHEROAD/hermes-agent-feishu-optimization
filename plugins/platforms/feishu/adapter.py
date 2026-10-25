@@ -1346,6 +1346,18 @@ _CARD_IDS: dict[str, str] = {}
 _CARD_SEQ: dict[str, int] = {}
 
 
+def _fmt_elapsed(seconds: float) -> str:
+    """Compact duration: 45s, 1m23s, 1h02m03s."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m{secs:02d}s"
+
+
 _TOOL_ROW_RE = re.compile(r"^\s*(?:┊\s*)?[💻🔀📖🌐📝🔧⚡🧪🎨📦🔍🤝📄🛠]")
 
 
@@ -1353,6 +1365,7 @@ def _build_progress_card(
     content: str, *, expanded: bool = False, count: int = 0, final_text: Optional[str] = None,
     reply_open_id: Optional[str] = None, bg_tasks: Optional[list[dict[str, Any]]] = None,
     status_label: Optional[str] = None, subagents: Optional[list[str]] = None,
+    elapsed_s: Optional[float] = None,
 ) -> dict[str, Any]:
     """Collapsible tool-progress card, optionally carrying the turn's final answer.
 
@@ -1416,6 +1429,15 @@ def _build_progress_card(
             "tag": "markdown",
             "element_id": "final",
             "content": _sanitize_card_text(final_text, reply_open_id),
+        })
+    if elapsed_s is not None:
+        # Bottom line of the card: how long this turn has been running (or took, once done).
+        if elements:
+            elements.append({"tag": "hr", "element_id": "footer_sep"})
+        elements.append({
+            "tag": "markdown",
+            "element_id": "footer",
+            "content": f"⏱ 总耗时 {_fmt_elapsed(elapsed_s)}",
         })
     # Card JSON 2.0: headings, quotes and TABLES only render in the 2.0 structure; the 1.0
     # shape silently flattens them to plain text.
@@ -1623,6 +1645,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # not the message id, and every operation must carry a strictly increasing sequence.
         self._card_id_by_chat = _CARD_IDS
         self._card_seq = _CARD_SEQ
+        # Start of the turn currently owning this chat's card, for the footer duration.
+        self._turn_started_at: dict[str, float] = {}
         self._loop: Any = None
         self._load_seen_message_ids()
 
@@ -1966,6 +1990,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         reply_open_id=_progress_reply_open_id(metadata),
                         bg_tasks=self._bg_task_card_tasks.get(chat_id),
                         subagents=self._subagent_lines(chat_id),
+                        elapsed_s=self._turn_elapsed(chat_id),
                         status_label=self._status_label(chat_id),
                     ), ensure_ascii=False,
                 )
@@ -2063,6 +2088,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 reply_open_id=_progress_reply_open_id(metadata),
                 bg_tasks=self._bg_task_card_tasks.get(chat_id),
                 subagents=self._subagent_lines(chat_id),
+                elapsed_s=self._turn_elapsed(chat_id),
             )
             _payload = json.dumps(_card, ensure_ascii=False)
             if len(_payload.encode("utf-8")) > 28000:
@@ -2093,6 +2119,7 @@ class FeishuAdapter(BasePlatformAdapter):
             reply_open_id=_progress_reply_open_id(metadata),
             bg_tasks=self._bg_task_card_tasks.get(chat_id),
             subagents=self._subagent_lines(chat_id),
+            elapsed_s=self._turn_elapsed(chat_id),
         )
         payload = json.dumps(card, ensure_ascii=False)
         # Feishu caps a card update at 30 KB; fall back to a normal send past that.
@@ -2184,6 +2211,11 @@ class FeishuAdapter(BasePlatformAdapter):
                     await self._cardkit_patch_element(
                         chat_id, "subagents", {"content": "\n".join(self._subagent_lines(chat_id))},
                     )
+                _elapsed = self._turn_elapsed(chat_id)
+                if _elapsed is not None:
+                    await self._cardkit_patch_element(
+                        chat_id, "footer", {"content": f"⏱ 总耗时 {_fmt_elapsed(_elapsed)}"},
+                    )
                 self._last_progress_at[chat_id] = time.time()
                 return
         except Exception:
@@ -2194,6 +2226,7 @@ class FeishuAdapter(BasePlatformAdapter):
             final_text=self._final_card_text.get(message_id),
             bg_tasks=self._bg_task_card_tasks.get(chat_id),
             subagents=self._subagent_lines(chat_id),
+            elapsed_s=self._turn_elapsed(chat_id),
             status_label=self._status_label(chat_id),
         )
         payload = json.dumps(card, ensure_ascii=False)
@@ -2285,6 +2318,11 @@ class FeishuAdapter(BasePlatformAdapter):
                     line = f"{line.rstrip()} · {dur}s"
             out.append(line)
         return "\n".join(out)
+
+    def _turn_elapsed(self, chat_id: str) -> Optional[float]:
+        """Seconds since this turn's card was opened (None when no turn is tracked)."""
+        started = self._turn_started_at.get(chat_id)
+        return (time.time() - started) if started else None
 
     def _status_label(self, chat_id: str, *, idle: float = 0.0) -> str:
         st = self._agent_status.get(chat_id) or {}
@@ -2395,6 +2433,9 @@ class FeishuAdapter(BasePlatformAdapter):
         """Open the turn's progress card as soon as the message is accepted, so the chat sees
         activity before (and even without) any tool call."""
         self._turn_internal[chat_id] = bool(internal)
+        # A notice-driven turn inherits the running clock of the user's turn.
+        if not internal or chat_id not in self._turn_started_at:
+            self._turn_started_at[chat_id] = time.time()
         try:
             # Remember the gateway loop first: status refreshes from callback threads need it even
             # when this turn reuses an existing bubble.
@@ -2476,6 +2517,11 @@ class FeishuAdapter(BasePlatformAdapter):
                             chat_id, "subagents",
                             {"content": "\n".join(self._subagent_lines(chat_id))},
                         )
+                    _elapsed = self._turn_elapsed(chat_id)
+                    if _elapsed is not None:
+                        await self._cardkit_patch_element(
+                            chat_id, "footer", {"content": f"⏱ 总耗时 {_fmt_elapsed(_elapsed)}"},
+                        )
                     self._last_progress_at[chat_id] = time.time()
                     continue
                 card = _build_progress_card(
@@ -2484,6 +2530,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     status_label=_label,
                     bg_tasks=self._bg_task_card_tasks.get(chat_id),
                     subagents=self._subagent_lines(chat_id),
+                    elapsed_s=self._turn_elapsed(chat_id),
                 )
                 payload = json.dumps(card, ensure_ascii=False)
                 if len(payload.encode("utf-8")) > 28000:
@@ -2550,6 +2597,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     final_text=self._final_card_text.get(folded_id),
                     bg_tasks=tasks,
                     subagents=self._subagent_lines(chat_id),
+                    elapsed_s=self._turn_elapsed(chat_id),
                 )
                 folded_payload = json.dumps(card, ensure_ascii=False)
                 # Feishu caps a card update at 30 KB; fall through to a standalone card past that.
@@ -2650,6 +2698,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         reply_open_id=_progress_reply_open_id(metadata),
                         bg_tasks=self._bg_task_card_tasks.get(chat_id),
                         subagents=self._subagent_lines(chat_id),
+                        elapsed_s=self._turn_elapsed(chat_id),
                         status_label=self._status_label(chat_id),
                     ), ensure_ascii=False,
                 )
