@@ -1344,6 +1344,9 @@ def _progress_reply_open_id(metadata: Optional[dict[str, Any]]) -> Optional[str]
 # than the one that opened the turn card, and the CardKit entity must still be reachable.
 _CARD_IDS: dict[str, str] = {}
 _CARD_SEQ: dict[str, int] = {}
+# Heartbeat, status refresh and tool progress can race for the same card: allocate the
+# sequence under a lock so two updates never send the same number.
+_CARD_LOCK = threading.Lock()
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -2378,7 +2381,9 @@ class FeishuAdapter(BasePlatformAdapter):
         card_id = self._card_id_by_chat.get(chat_id)
         if not card_id or not self._client:
             return False
-        seq = self._card_seq.get(chat_id, 0) + 1
+        with _CARD_LOCK:
+            seq = self._card_seq.get(chat_id, 0) + 1
+            self._card_seq[chat_id] = seq
         try:
             from lark_oapi.api.cardkit.v1 import PatchCardElementRequest, PatchCardElementRequestBody
             body = (
@@ -2410,12 +2415,19 @@ class FeishuAdapter(BasePlatformAdapter):
         card_id = self._card_id_by_chat.get(chat_id)
         if not card_id or not self._client:
             return False
-        seq = self._card_seq.get(chat_id, 0) + 1
+        with _CARD_LOCK:
+            seq = self._card_seq.get(chat_id, 0) + 1
+            self._card_seq[chat_id] = seq
         try:
-            from lark_oapi.api.cardkit.v1 import UpdateCardRequest, UpdateCardRequestBody
+            from lark_oapi.api.cardkit.v1 import Card, UpdateCardRequest, UpdateCardRequestBody
             body = (
                 UpdateCardRequestBody.builder()
-                .card(json.dumps(card, ensure_ascii=False))
+                .card(
+                    Card.builder()
+                    .type("card_json")
+                    .data(json.dumps(card, ensure_ascii=False))
+                    .build()
+                )
                 .sequence(seq)
                 .build()
             )
