@@ -1340,6 +1340,9 @@ def _progress_reply_open_id(metadata: Optional[dict[str, Any]]) -> Optional[str]
     return str(value) if value else None
 
 
+_TOOL_ROW_RE = re.compile(r"^\s*(?:┊\s*)?[💻🔀📖🌐📝🔧⚡🧪🎨📦🔍🤝📄🛠]")
+
+
 def _build_progress_card(
     content: str, *, expanded: bool = False, count: int = 0, final_text: Optional[str] = None,
     reply_open_id: Optional[str] = None, bg_tasks: Optional[list[dict[str, Any]]] = None,
@@ -2174,7 +2177,7 @@ class FeishuAdapter(BasePlatformAdapter):
             key = line.strip()[:100]
             if key:
                 seen.setdefault(key, now)
-            if i != running and key and not re.search(r"·\s*\d+s$", line):
+            if i != running and key and _TOOL_ROW_RE.match(line) and not re.search(r"·\s*\d+s$", line):
                 dur = int(now - seen.get(key, now))
                 if dur >= 1:
                     line = f"{line.rstrip()} · {dur}s"
@@ -2307,6 +2310,7 @@ class FeishuAdapter(BasePlatformAdapter):
         old = self._final_card_by_chat.get(chat_id)
         if old and old != message_id:
             self._progress_card_bodies.pop(old, None)
+            self._progress_card_counts.pop(old, None)
             self._final_card_text.pop(old, None)
         self._final_card_by_chat[chat_id] = message_id
 
