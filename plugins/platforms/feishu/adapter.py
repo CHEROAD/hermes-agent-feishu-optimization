@@ -2219,6 +2219,9 @@ class FeishuAdapter(BasePlatformAdapter):
         if state == "tool":
             head = f"🔧 工具调用中 · {detail}" if detail else "🔧 工具调用中"
             return f"{head} · {elapsed}s"
+        if state in {"redirect", "steer"}:
+            head = "↪ 已收到补充，按新指令调整" if state == "redirect" else "⏩ 已插话，下次工具调用后生效"
+            return f"{head} · {elapsed}s"
         if idle >= 180:
             return f"⚠️ 可能卡住 · {int(idle // 60)} 分钟无响应"
         if idle >= 60:

@@ -993,6 +993,21 @@ class GatewayBusySessionMixin:
             demoted_for_subagents=_steer.demoted_for_subagents,
             demoted_for_compression=_steer.demoted_for_compression,
         )
+        # Feishu already carries a live turn card: fold the busy ack into its status strip
+        # instead of sending a second chat bubble next to the answer.
+        _src = getattr(event, "source", None)
+        if "feishu" in str(getattr(_src, "platform", "")).lower():
+            try:
+                _ack_adapter = adapter or self._delivery_adapter_for(_src)
+                _note = getattr(_ack_adapter, "note_agent_status", None)
+                if callable(_note) and getattr(_src, "chat_id", None):
+                    _note(
+                        _src.chat_id,
+                        "redirect" if is_redirect_mode else "steer",
+                    )
+                    return
+            except Exception:
+                logger.debug("feishu busy ack fold failed", exc_info=True)
         await self._send_busy_ack_reply(event, adapter, message)
 
     # Slash name → handler method is ``_handle_<name>_command`` (``-`` → ``_``) except these.
