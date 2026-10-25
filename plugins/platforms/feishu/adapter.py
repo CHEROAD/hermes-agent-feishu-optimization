@@ -1352,7 +1352,7 @@ def _build_progress_card(
     the answer below the panel so a whole turn occupies one message.
     """
     title = f"🔧 工具调用 ({count})" if count > 0 else "🔧 工具调用"
-    body = _trim_progress_body(_sanitize_card_text(content) or "…")
+    body = _trim_progress_body(_sanitize_card_text(content) or "准备中…")
     elements: list[dict[str, Any]] = [
         {
             "tag": "collapsible_panel",
@@ -1931,7 +1931,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         reply_open_id=_progress_reply_open_id(metadata),
                         bg_tasks=self._bg_task_card_tasks.get(chat_id),
                         subagents=self._subagent_lines(chat_id),
-                        status_label="工具调用中",
+                        status_label=self._status_label(chat_id),
                     ), ensure_ascii=False,
                 )
                 response = await self._feishu_send_with_retry(
@@ -2409,7 +2409,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         reply_open_id=_progress_reply_open_id(metadata),
                         bg_tasks=self._bg_task_card_tasks.get(chat_id),
                         subagents=self._subagent_lines(chat_id),
-                        status_label="工具调用中",
+                        status_label=self._status_label(chat_id),
                     ), ensure_ascii=False,
                 )
                 result = await _update(None, card_payload, method=getattr(HttpMethod, "PATCH", None))
