@@ -1747,8 +1747,12 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if not tasks:
                 logger.info("[bg-card] no tasks matched chat_id=%r (session=%r)", chat_id, current_id)
                 return False
-            result = await updater(chat_id, tasks[-12:])
-            logger.info("[bg-card] updated chat=%r tasks=%d success=%s", chat_id, len(tasks[-12:]), getattr(result, "success", None))
+            hidden = getattr(self, "_bg_shown_ids", {}).get(chat_id, set())
+            visible = [t for t in tasks if t.get("status") == "running" or t.get("id") not in hidden]
+            if not visible:
+                return False
+            result = await updater(chat_id, visible[-12:])
+            logger.info("[bg-card] updated chat=%r tasks=%d success=%s", chat_id, len(visible[-12:]), getattr(result, "success", None))
             return bool(getattr(result, "success", False))
         except Exception:
             logger.info("[bg-card] delivery failed", exc_info=True)
@@ -1790,9 +1794,18 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                     "exit_code": exit_code,
                     "duration": duration,
                 })
+            shown = getattr(self, "_bg_shown_ids", None)
+            if shown is None:
+                shown = self._bg_shown_ids = {}
             for chat, tasks in by_chat.items():
-                await updater(chat, tasks[-12:])
-                logger.info("[bg-card] refresh chat=%r tasks=%d", chat, len(tasks[-12:]))
+                hidden = shown.get(chat, set())
+                visible = [t for t in tasks if t.get("status") == "running" or t.get("id") not in hidden]
+                await updater(chat, visible[-12:])
+                shown[chat] = {t.get("id", "") for t in visible if t.get("id")}
+                logger.info(
+                    "[bg-card] refresh chat=%r tasks=%d (hidden=%d)",
+                    chat, len(visible[-12:]), len(tasks) - len(visible),
+                )
         except Exception:
             logger.info("[bg-card] refresh failed", exc_info=True)
 
