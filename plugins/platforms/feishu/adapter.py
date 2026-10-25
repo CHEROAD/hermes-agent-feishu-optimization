@@ -1590,6 +1590,8 @@ class FeishuAdapter(BasePlatformAdapter):
         # Sub-agents get their own rows under the main status, not the status line itself.
         self._subagents: dict[str, dict[int, dict[str, Any]]] = {}
         self._subagent_seq: dict[str, int] = {}
+        # Per-line first-seen stamps, so finished tools can show their elapsed time.
+        self._line_first_seen: dict[str, dict[str, float]] = {}
         self._loop: Any = None
         self._load_seen_message_ids()
 
@@ -1925,7 +1927,7 @@ class FeishuAdapter(BasePlatformAdapter):
             try:
                 card_payload = json.dumps(
                     _build_progress_card(
-                        formatted, count=_progress_tool_count(metadata),
+                        self._decorate_progress_body(chat_id, formatted), count=_progress_tool_count(metadata),
                         reply_open_id=_progress_reply_open_id(metadata),
                         bg_tasks=self._bg_task_card_tasks.get(chat_id),
                         subagents=self._subagent_lines(chat_id),
@@ -2014,7 +2016,7 @@ class FeishuAdapter(BasePlatformAdapter):
             return False
         body = self._progress_card_bodies.get(message_id, "")
         card = _build_progress_card(
-            body, count=self._progress_card_counts.get(message_id, 0), final_text=text,
+            self._decorate_progress_body(chat_id, body), count=self._progress_card_counts.get(message_id, 0), final_text=text,
             reply_open_id=_progress_reply_open_id(metadata),
             bg_tasks=self._bg_task_card_tasks.get(chat_id),
             subagents=self._subagent_lines(chat_id),
@@ -2092,7 +2094,7 @@ class FeishuAdapter(BasePlatformAdapter):
         if not message_id or not self._client:
             return
         card = _build_progress_card(
-            self._progress_card_bodies.get(message_id, ""),
+            self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
             count=self._progress_card_counts.get(message_id, 0),
             final_text=self._final_card_text.get(message_id),
             bg_tasks=self._bg_task_card_tasks.get(chat_id),
@@ -2119,7 +2121,7 @@ class FeishuAdapter(BasePlatformAdapter):
         seq = self._subagent_seq.get(chat_id, 0) + 1
         self._subagent_seq[chat_id] = seq
         rows = self._subagents.setdefault(chat_id, {})
-        rows[seq] = {"name": name, "state": "运行中"}
+        rows[seq] = {"name": name, "state": "运行中", "since": time.time()}
         self._last_progress_at[chat_id] = time.time()
         self._schedule_status_refresh(chat_id)
         return seq
@@ -2139,7 +2141,42 @@ class FeishuAdapter(BasePlatformAdapter):
 
     def _subagent_lines(self, chat_id: str) -> list[str]:
         rows = self._subagents.get(chat_id) or {}
-        return [f"🤖 sub agent {seq}: {rows[seq].get('state', '')}" for seq in sorted(rows)]
+        now = time.time()
+        out = []
+        for seq in sorted(rows):
+            row = rows[seq]
+            state = row.get("state", "")
+            # Running sub-agents tick like the main status; finished ones show the state only.
+            suffix = f" · {int(now - row.get('since', now))}s" if state == "运行中" else ""
+            out.append(f"🤖 sub agent {seq}: {state}{suffix}")
+        return out
+
+    def _decorate_progress_body(self, chat_id: str, content: str) -> str:
+        """Append each finished tool's elapsed time, so rows match the status strip's style.
+
+        A row counts as finished once a newer row appears, or when the agent has moved on to
+        thinking/waiting; the row still running is left bare.
+        """
+        if not content:
+            return content
+        lines = content.rstrip("\n").split("\n")
+        if not lines:
+            return content
+        now = time.time()
+        seen = self._line_first_seen.setdefault(chat_id, {})
+        state = (self._agent_status.get(chat_id) or {}).get("state")
+        running = -1 if state in {"thinking", "waiting"} else len(lines) - 1
+        out: list[str] = []
+        for i, line in enumerate(lines):
+            key = line.strip()[:100]
+            if key:
+                seen.setdefault(key, now)
+            if i != running and key and not re.search(r"·\s*\d+s$", line):
+                dur = int(now - seen.get(key, now))
+                if dur >= 1:
+                    line = f"{line.rstrip()} · {dur}s"
+            out.append(line)
+        return "\n".join(out)
 
     def _status_label(self, chat_id: str, *, idle: float = 0.0) -> str:
         st = self._agent_status.get(chat_id) or {}
@@ -2177,6 +2214,7 @@ class FeishuAdapter(BasePlatformAdapter):
         # Fresh sub-agent numbering for this turn.
         self._subagents.pop(chat_id, None)
         self._subagent_seq[chat_id] = 0
+        self._line_first_seen.pop(chat_id, None)
         self.note_agent_status(chat_id, "thinking")
         card = _build_progress_card(
             "", count=0, reply_open_id=_progress_reply_open_id(metadata),
@@ -2216,7 +2254,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     # Blocked on the user: not a stall, and no ticking.
                     continue
                 card = _build_progress_card(
-                    self._progress_card_bodies.get(message_id, ""),
+                    self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
                     count=self._progress_card_counts.get(message_id, 0),
                     final_text=self._final_card_text.get(message_id),
                     bg_tasks=self._bg_task_card_tasks.get(chat_id),
@@ -2280,7 +2318,7 @@ class FeishuAdapter(BasePlatformAdapter):
             folded_id = self._progress_card_by_chat.get(chat_id) or self._final_card_by_chat.get(chat_id)
             if folded_id and (folded_id in self._progress_card_bodies or folded_id in self._final_card_text):
                 card = _build_progress_card(
-                    self._progress_card_bodies.get(folded_id, ""),
+                    self._decorate_progress_body(chat_id, self._progress_card_bodies.get(folded_id, "")),
                     count=self._progress_card_counts.get(folded_id, 0),
                     final_text=self._final_card_text.get(folded_id),
                     bg_tasks=tasks,
@@ -2367,7 +2405,7 @@ class FeishuAdapter(BasePlatformAdapter):
             try:
                 card_payload = json.dumps(
                     _build_progress_card(
-                        content, count=_progress_tool_count(metadata),
+                        self._decorate_progress_body(chat_id, content), count=_progress_tool_count(metadata),
                         reply_open_id=_progress_reply_open_id(metadata),
                         bg_tasks=self._bg_task_card_tasks.get(chat_id),
                         subagents=self._subagent_lines(chat_id),
