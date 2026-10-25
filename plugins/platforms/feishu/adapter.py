@@ -1352,8 +1352,6 @@ def _build_progress_card(
     the answer below the panel so a whole turn occupies one message.
     """
     title = f"🔧 工具调用 ({count})" if count > 0 else "🔧 工具调用"
-    if status_label:
-        title = f"{title} · {status_label}"
     body = _trim_progress_body(_sanitize_card_text(content) or "…")
     elements: list[dict[str, Any]] = [
         {
@@ -1381,6 +1379,14 @@ def _build_progress_card(
         # Sits between the tool panel and the final answer, so a turn reads top-down:
         # tools → background jobs → reply.
         elements.append(_bg_panel_element(bg_tasks))
+    if status_label and not final_text:
+        # Its own strip at the bottom of the card: tools → background jobs → live status.
+        elements.append({"tag": "hr"})
+        elements.append({
+            "tag": "markdown",
+            "content": status_label,
+            "text_align": "left",
+        })
     if final_text:
         elements.append({
             "tag": "markdown",
@@ -2062,13 +2068,13 @@ class FeishuAdapter(BasePlatformAdapter):
         if state == "waiting":
             return "⏳ 等你确认"
         if state == "tool":
-            head = f"工具调用中 · {detail}" if detail else "工具调用中"
+            head = f"🔧 工具调用中 · {detail}" if detail else "🔧 工具调用中"
             return f"{head} · {elapsed}s"
         if idle >= 180:
             return f"⚠️ 可能卡住 · {int(idle // 60)} 分钟无响应"
         if idle >= 60:
-            return f"思考中 · 距上次活动 {int(idle)}s"
-        return f"思考中 · {elapsed}s"
+            return f"🧠 思考中 · 距上次活动 {int(idle)}s"
+        return f"🧠 思考中 · {elapsed}s"
 
     async def begin_turn_card(self, chat_id: str, reply_to: Optional[str] = None,
                               metadata: Optional[dict[str, Any]] = None) -> Optional[str]:
@@ -2076,6 +2082,9 @@ class FeishuAdapter(BasePlatformAdapter):
         activity before (and even without) any tool call."""
         if not self._client or chat_id in self._progress_card_by_chat:
             return None
+        # A new turn starts with no jobs of its own: drop the previous turn's list so the
+        # panel never opens showing stale background tasks.
+        self._bg_task_card_tasks.pop(chat_id, None)
         self.note_agent_status(chat_id, "thinking")
         card = _build_progress_card(
             "", count=0, reply_open_id=_progress_reply_open_id(metadata),
