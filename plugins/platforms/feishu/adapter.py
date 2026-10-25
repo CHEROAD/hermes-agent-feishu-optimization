@@ -2382,7 +2382,9 @@ class FeishuAdapter(BasePlatformAdapter):
                     logger.info("[Feishu] folding background tasks into the turn card failed: %s", result.error)
                     if self._final_card_by_chat.get(chat_id) == folded_id:
                         self._final_card_by_chat.pop(chat_id, None)
-            payload = json.dumps(_build_background_tasks_card(tasks), ensure_ascii=False)
+            # No turn card to fold into: stay silent rather than spawn a standalone panel bubble
+            # that reads as another fragment of the conversation.
+            return SendResult(success=True)
         except Exception as exc:
             logger.warning("[Feishu] background task card build failed: %s", exc)
             return SendResult(success=False, error=str(exc))
