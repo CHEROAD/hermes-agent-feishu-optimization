@@ -271,10 +271,16 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 _begin_card = getattr(_fc_adapter, "begin_turn_card", None)
                 if callable(_begin_card) and getattr(source, "chat_id", None):
                     try:
+                        _card_meta: dict[str, Any] = {}
+                        if source.user_id:
+                            _card_meta["reply_open_id"] = source.user_id
+                        # Topic groups need the thread id or the card lands in the main chat.
+                        if getattr(source, "thread_id", None):
+                            _card_meta["thread_id"] = str(source.thread_id)
                         await _begin_card(
                             source.chat_id,
                             reply_to=self._reply_anchor_for_event(event),
-                            metadata={"reply_open_id": source.user_id} if source.user_id else None,
+                            metadata=_card_meta or None,
                         )
                     except Exception:
                         logger.debug("feishu turn card open failed", exc_info=True)

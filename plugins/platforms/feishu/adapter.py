@@ -1598,6 +1598,9 @@ class FeishuAdapter(BasePlatformAdapter):
         self._subagent_seq: dict[str, int] = {}
         # Per-line first-seen stamps, so finished tools can show their elapsed time.
         self._line_first_seen: dict[str, dict[str, float]] = {}
+        # Status-refresh throttle: tool events already patch the card, so a state change within
+        # the same second doesn't need a second round-trip.
+        self._status_refresh_at: dict[str, float] = {}
         self._loop: Any = None
         self._load_seen_message_ids()
 
@@ -2090,6 +2093,12 @@ class FeishuAdapter(BasePlatformAdapter):
         loop = getattr(self, "_loop", None)
         if loop is None or loop.is_closed():
             return
+        now = time.time()
+        # Tool progress patches the same card a moment later, so skip the duplicate within 1s;
+        # a dropped refresh is superseded by that patch or the next state change.
+        if now - self._status_refresh_at.get(chat_id, 0) < 1.0:
+            return
+        self._status_refresh_at[chat_id] = now
         try:
             asyncio.run_coroutine_threadsafe(self._refresh_status_card(chat_id), loop)
         except Exception:
@@ -2303,10 +2312,11 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id = self._progress_card_by_chat.pop(chat_id, None)
         if not message_id:
             return
-        # Jobs shown in this turn stay hidden in the next turn's panel.
-        self._bg_seen_ids[chat_id] = {
-            t.get("id", "") for t in self._bg_task_card_tasks.get(chat_id, []) if t.get("id")
-        }
+        # Jobs shown in this turn stay hidden in the next turn's panel. Keep the set bounded:
+        # there is no value in remembering every job id for the life of the chat.
+        _seen = set(self._bg_seen_ids.get(chat_id, set()))
+        _seen.update(t.get("id", "") for t in self._bg_task_card_tasks.get(chat_id, []) if t.get("id"))
+        self._bg_seen_ids[chat_id] = set(sorted(_seen)[-50:])
         old = self._final_card_by_chat.get(chat_id)
         if old and old != message_id:
             self._progress_card_bodies.pop(old, None)

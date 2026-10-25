@@ -1108,6 +1108,22 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 return False
         return True
 
+    def _note_feishu_delegation_done(self, evt: dict) -> None:
+        """Flip the Feishu sub-agent row to 完成 when an async delegation finishes."""
+        try:
+            adapter = self.adapters.get(Platform.FEISHU)
+            fn = getattr(adapter, "note_subagent_done_last", None)
+            if not callable(fn):
+                return
+            chat_id = str(evt.get("chat_id") or "").strip()
+            if not chat_id:
+                parts = str(evt.get("session_key") or "").split(":")
+                chat_id = parts[-1] if len(parts) >= 4 else ""
+            if chat_id:
+                fn(chat_id, "完成")
+        except Exception:
+            logger.debug("feishu delegation done note failed", exc_info=True)
+
     async def _preflight_completion_delivery(self, evt: dict) -> _CompletionClaim:
         """Claim the durable row (async delegations) and verify the target before adapter acceptance.
 
@@ -1117,6 +1133,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
         """
         claim = self._CompletionClaim()
         evt_type = evt.get("type")
+        if evt_type == "async_delegation":
+            # Close the Feishu sub-agent row even if delivery is later dropped.
+            self._note_feishu_delegation_done(evt)
         if evt_type == "async_delegation" and not await self._completion_delivery_ready(evt):
             claim.proceed, claim.early_result = False, False
             return claim
