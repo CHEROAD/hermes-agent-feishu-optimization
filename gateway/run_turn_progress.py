@@ -875,8 +875,24 @@ class GatewayTurnProgressMixin:
             "type": "tool.completed", "tool_call_id": str(call_id or ""), "tool_name": name, "is_error": bool(is_error),
         })
 
+    def _note_feishu_status(self, state: str, detail=None) -> None:
+        """Mirror the agent's live state onto the Feishu turn card (best effort)."""
+        try:
+            ctx = self._ctx
+            source = getattr(ctx, "source", None)
+            if source is None or getattr(source, "platform", None) != Platform.FEISHU:
+                return
+            adapter = self._runner._delivery_adapter_for(source)
+            fn = getattr(adapter, "note_agent_status", None)
+            chat_id = getattr(source, "chat_id", None)
+            if callable(fn) and chat_id:
+                fn(chat_id, state, detail)
+        except Exception:
+            logger.debug("feishu status note failed", exc_info=True)
+
     def combined_tool_start_callback(self, call_id, tool_name, args):
         """Compose the voice ack + native task-card start consumers."""
+        self._note_feishu_status("tool", str(tool_name or "tool"))
         if local_viewer_turn(self):
             from gateway import local_viewer_events
             local_viewer_events.note_tool_start(self, call_id, tool_name, args)
@@ -889,6 +905,7 @@ class GatewayTurnProgressMixin:
 
     def combined_tool_complete_callback(self, call_id, tool_name, args, result):
         from agent.display import _detect_tool_failure
+        self._note_feishu_status("thinking")
         is_error, _ = _detect_tool_failure(tool_name, result)
         owner = self._approval_owner
         live = owner[0].sessions.get(owner[1]) if owner is not None else None
@@ -916,6 +933,7 @@ class GatewayTurnProgressMixin:
         if not ctx._run_still_current():
             return
         self._publish_execution("agent.step", {"iteration": iteration})
+        self._note_feishu_status("thinking")
         if iteration > 1 and local_viewer_turn(self):
             # Each step after the first follows a finished API call: main's CLI repainted its status
             # bar from the agent's counters right then (the last call is covered at turn end).

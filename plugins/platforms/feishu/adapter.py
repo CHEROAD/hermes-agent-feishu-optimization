@@ -1571,6 +1571,9 @@ class FeishuAdapter(BasePlatformAdapter):
         # Heartbeat: keep the progress card ticking so a long think/tool run never looks dead.
         self._heartbeat_tasks: dict[str, Any] = {}
         self._last_progress_at: dict[str, float] = {}
+        # What the agent is doing right now: thinking / tool / waiting. Written by gateway
+        # callbacks, read by the heartbeat to age the label and flag a stalled turn.
+        self._agent_status: dict[str, dict[str, Any]] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1895,6 +1898,13 @@ class FeishuAdapter(BasePlatformAdapter):
 
         # Tool-progress lane: one collapsed card per bubble, later edits replace it in place.
         if _is_progress_card_request(metadata):
+            # The turn card may already exist (opened when the message arrived): patch that
+            # bubble instead of stacking a second one on top of it.
+            _existing_card = self._progress_card_by_chat.get(chat_id)
+            if _existing_card:
+                _edited = await self.edit_message(chat_id, _existing_card, content, metadata=metadata)
+                if _edited.success:
+                    return _edited
             try:
                 card_payload = json.dumps(
                     _build_progress_card(
@@ -2034,9 +2044,64 @@ class FeishuAdapter(BasePlatformAdapter):
         if task is not None and not task.done():
             task.cancel()
 
+    def note_agent_status(self, chat_id: str, state: str, detail: Optional[str] = None) -> None:
+        """Record what the agent is doing and stamp activity (called from gateway callbacks).
+
+        state: ``thinking`` (model generating), ``tool`` (waiting on a tool), ``waiting``
+        (blocked on the user, so the heartbeat must not tick).
+        """
+        now = time.time()
+        self._agent_status[chat_id] = {"state": state, "detail": detail, "since": now}
+        self._last_progress_at[chat_id] = now
+
+    def _status_label(self, chat_id: str, *, idle: float = 0.0) -> str:
+        st = self._agent_status.get(chat_id) or {}
+        state = st.get("state") or "thinking"
+        detail = st.get("detail")
+        elapsed = int(time.time() - (st.get("since") or time.time()))
+        if state == "waiting":
+            return "⏳ 等你确认"
+        if state == "tool":
+            head = f"工具调用中 · {detail}" if detail else "工具调用中"
+            return f"{head} · {elapsed}s"
+        if idle >= 180:
+            return f"⚠️ 可能卡住 · {int(idle // 60)} 分钟无响应"
+        if idle >= 60:
+            return f"思考中 · 距上次活动 {int(idle)}s"
+        return f"思考中 · {elapsed}s"
+
+    async def begin_turn_card(self, chat_id: str, reply_to: Optional[str] = None,
+                              metadata: Optional[dict[str, Any]] = None) -> Optional[str]:
+        """Open the turn's progress card as soon as the message is accepted, so the chat sees
+        activity before (and even without) any tool call."""
+        if not self._client or chat_id in self._progress_card_by_chat:
+            return None
+        self.note_agent_status(chat_id, "thinking")
+        card = _build_progress_card(
+            "", count=0, reply_open_id=_progress_reply_open_id(metadata),
+            status_label=self._status_label(chat_id),
+        )
+        payload = json.dumps(card, ensure_ascii=False)
+        try:
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id, msg_type="interactive", payload=payload,
+                reply_to=reply_to, metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "turn card send failed")
+            if not (result.success and result.message_id):
+                return None
+            self._remember_progress_card(result.message_id)
+            self._progress_card_by_chat[chat_id] = result.message_id
+            self._progress_card_bodies[result.message_id] = ""
+            self._start_progress_heartbeat(chat_id, result.message_id)
+            return result.message_id
+        except Exception:
+            logger.debug("[Feishu] begin turn card failed", exc_info=True)
+            return None
+
     async def _progress_heartbeat_loop(self, chat_id: str, message_id: str) -> None:
-        """Idle-only heartbeat: stay silent while callbacks keep the card fresh, and emit one
-        tick only after 60s without any update so the chat can tell the agent is still alive."""
+        """Idle-only heartbeat: stays silent while callbacks keep the card fresh, then re-renders
+        it with the activity age — amber past 60s, red past 3 minutes."""
         started = time.time()
         try:
             while True:
@@ -2046,13 +2111,15 @@ class FeishuAdapter(BasePlatformAdapter):
                 idle = time.time() - self._last_progress_at.get(chat_id, started)
                 if idle < 60:
                     continue
-                elapsed = int(time.time() - started)
+                if (self._agent_status.get(chat_id) or {}).get("state") == "waiting":
+                    # Blocked on the user: not a stall, and no ticking.
+                    continue
                 card = _build_progress_card(
                     self._progress_card_bodies.get(message_id, ""),
                     count=self._progress_card_counts.get(message_id, 0),
                     final_text=self._final_card_text.get(message_id),
                     bg_tasks=self._bg_task_card_tasks.get(chat_id),
-                    status_label=f"思考中 · {elapsed}s",
+                    status_label=self._status_label(chat_id, idle=idle),
                 )
                 payload = json.dumps(card, ensure_ascii=False)
                 if len(payload.encode("utf-8")) > 28000:

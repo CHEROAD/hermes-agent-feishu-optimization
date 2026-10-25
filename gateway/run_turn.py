@@ -264,6 +264,20 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
                 # Persist the coherent context+channel pair before execution: a crash during the
                 # human turn may be followed by an internal startup-resume on the next process.
                 await self._persist_prompt_pins(session_key, _run_start_session_id)
+            # Feishu: open the turn card up front so the chat sees a live status before the
+            # first tool call — and even when the model only thinks and never calls a tool.
+            if source.platform == Platform.FEISHU:
+                _fc_adapter = self._delivery_adapter_for(source)
+                _begin_card = getattr(_fc_adapter, "begin_turn_card", None)
+                if callable(_begin_card) and getattr(source, "chat_id", None):
+                    try:
+                        await _begin_card(
+                            source.chat_id,
+                            reply_to=self._reply_anchor_for_event(event),
+                            metadata={"reply_open_id": source.user_id} if source.user_id else None,
+                        )
+                    except Exception:
+                        logger.debug("feishu turn card open failed", exc_info=True)
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
