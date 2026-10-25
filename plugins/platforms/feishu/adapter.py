@@ -1340,6 +1340,12 @@ def _progress_reply_open_id(metadata: Optional[dict[str, Any]]) -> Optional[str]
     return str(value) if value else None
 
 
+# Shared across adapter instances: the gateway can route a send through a different instance
+# than the one that opened the turn card, and the CardKit entity must still be reachable.
+_CARD_IDS: dict[str, str] = {}
+_CARD_SEQ: dict[str, int] = {}
+
+
 _TOOL_ROW_RE = re.compile(r"^\s*(?:┊\s*)?[💻🔀📖🌐📝🔧⚡🧪🎨📦🔍🤝📄🛠]")
 
 
@@ -1362,6 +1368,7 @@ def _build_progress_card(
     if count > 0 and content and content.strip():
         elements.append({
             "tag": "collapsible_panel",
+            "element_id": "tools_panel",
             "expanded": bool(expanded),
             "header": {
                 "title": {"tag": "plain_text", "content": title},
@@ -1378,18 +1385,21 @@ def _build_progress_card(
             "border": {"color": "grey", "corner_radius": "5px"},
             "vertical_spacing": "8px",
             "padding": "8px 8px 8px 8px",
-            "elements": [{"tag": "markdown", "content": body}],
+            "elements": [{"tag": "markdown", "element_id": "tools_body", "content": body}],
         })
     if bg_tasks:
         # Sits between the tool panel and the final answer, so a turn reads top-down:
         # tools → background jobs → reply.
-        elements.append(_bg_panel_element(bg_tasks))
+        _bg_el = _bg_panel_element(bg_tasks)
+        _bg_el["element_id"] = "bg_panel"
+        elements.append(_bg_el)
     if status_label and not final_text:
         # Its own strip at the bottom of the card: tools → background jobs → live status.
         if elements:
-            elements.append({"tag": "hr"})
+            elements.append({"tag": "hr", "element_id": "status_sep"})
         elements.append({
             "tag": "markdown",
+            "element_id": "status",
             "content": status_label,
             "text_align": "left",
         })
@@ -1397,19 +1407,22 @@ def _build_progress_card(
         # One row per sub-agent, below the main status.
         elements.append({
             "tag": "markdown",
+            "element_id": "subagents",
             "content": "\n".join(subagents),
             "text_align": "left",
         })
     if final_text:
         elements.append({
             "tag": "markdown",
+            "element_id": "final",
             "content": _sanitize_card_text(final_text, reply_open_id),
         })
     # Card JSON 2.0: headings, quotes and TABLES only render in the 2.0 structure; the 1.0
     # shape silently flattens them to plain text.
     return {
         "schema": "2.0",
-        "config": {"wide_screen_mode": True},
+        # update_multi is required for CardKit element-level patches on the same entity.
+        "config": {"wide_screen_mode": True, "update_multi": True},
         "body": {"elements": elements},
     }
 
@@ -1606,6 +1619,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # Whether the current turn came from an internal notice (not a user message): notice
         # turns fold into the card the user's turn opened instead of starting a new bubble.
         self._turn_internal: dict[str, bool] = {}
+        # CardKit entity behind the chat's turn card. Element patches address the entity id,
+        # not the message id, and every operation must carry a strictly increasing sequence.
+        self._card_id_by_chat = _CARD_IDS
+        self._card_seq = _CARD_SEQ
         self._loop: Any = None
         self._load_seen_message_ids()
 
@@ -2051,6 +2068,11 @@ class FeishuAdapter(BasePlatformAdapter):
             if len(_payload.encode("utf-8")) > 28000:
                 return False
             try:
+                # CardKit entity first: one sequence-guarded update, no message rewrite.
+                if await self._cardkit_update_card(chat_id, _card):
+                    self._final_card_text[_prev_id] = _merged
+                    self._final_card_at[chat_id] = time.time()
+                    return True
                 _body = self._build_update_message_body(msg_type=None, content=_payload)
                 _req = self._build_update_message_request(message_id=_prev_id, request_body=_body)
                 _patch = getattr(HttpMethod, "PATCH", None)
@@ -2078,6 +2100,10 @@ class FeishuAdapter(BasePlatformAdapter):
             logger.info("[Feishu] final answer too large to fold into the progress card")
             return False
         try:
+            # CardKit entity first; the message-level PATCH stays as the fallback.
+            if await self._cardkit_update_card(chat_id, card):
+                self._final_card_text[message_id] = text
+                return True
             request_body = self._build_update_message_body(msg_type=None, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=request_body)
             patch = getattr(HttpMethod, "PATCH", None)
@@ -2150,6 +2176,18 @@ class FeishuAdapter(BasePlatformAdapter):
         message_id = self._progress_card_by_chat.get(chat_id)
         if not message_id or not self._client:
             return
+        _label = self._status_label(chat_id)
+        try:
+            # Element-level first: a state change usually touches only the status strip.
+            if await self._cardkit_patch_element(chat_id, "status", {"content": _label}):
+                if self._subagents.get(chat_id):
+                    await self._cardkit_patch_element(
+                        chat_id, "subagents", {"content": "\n".join(self._subagent_lines(chat_id))},
+                    )
+                self._last_progress_at[chat_id] = time.time()
+                return
+        except Exception:
+            logger.debug("[Feishu] status element patch failed", exc_info=True)
         card = _build_progress_card(
             self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
             count=self._progress_card_counts.get(message_id, 0),
@@ -2270,6 +2308,87 @@ class FeishuAdapter(BasePlatformAdapter):
             return f"🧠 思考中 · 距上次活动 {int(idle)}s"
         return f"🧠 思考中 · {elapsed}s"
 
+    async def _cardkit_create_card(self, card: dict[str, Any]) -> Optional[str]:
+        """Create a CardKit entity so later updates can patch a single element."""
+        if not self._client:
+            return None
+        try:
+            from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
+            body = (
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(json.dumps(card, ensure_ascii=False))
+                .build()
+            )
+            request = CreateCardRequest.builder().request_body(body).build()
+            response = await self._run_blocking(self._client.cardkit.v1.card.create, request)
+            if not getattr(response, "success", lambda: False)():
+                logger.info("[Feishu] cardkit create failed: %s", getattr(response, "msg", ""))
+                return None
+            data = getattr(response, "data", None)
+            return str(getattr(data, "card_id", "") or "") or None
+        except Exception:
+            logger.debug("[Feishu] cardkit create error", exc_info=True)
+            return None
+
+    async def _cardkit_patch_element(
+        self, chat_id: str, element_id: str, partial: dict[str, Any],
+    ) -> bool:
+        """Patch one element of the chat's turn card — the cheap path for the status strip."""
+        card_id = self._card_id_by_chat.get(chat_id)
+        if not card_id or not self._client:
+            return False
+        seq = self._card_seq.get(chat_id, 0) + 1
+        try:
+            from lark_oapi.api.cardkit.v1 import PatchCardElementRequest, PatchCardElementRequestBody
+            body = (
+                PatchCardElementRequestBody.builder()
+                .partial_element(json.dumps(partial, ensure_ascii=False))
+                .sequence(seq)
+                .build()
+            )
+            request = (
+                PatchCardElementRequest.builder()
+                .card_id(card_id)
+                .element_id(element_id)
+                .request_body(body)
+                .build()
+            )
+            response = await self._run_blocking(self._client.cardkit.v1.card_element.patch, request)
+            if not getattr(response, "success", lambda: False)():
+                logger.info("[Feishu] cardkit patch %s failed: %s", element_id, getattr(response, "msg", ""))
+                return False
+            self._card_seq[chat_id] = seq
+            return True
+        except Exception:
+            logger.debug("[Feishu] cardkit patch error", exc_info=True)
+            return False
+
+    async def _cardkit_update_card(self, chat_id: str, card: dict[str, Any]) -> bool:
+        """Replace the whole card entity (the layout is dynamic: panels come and go)."""
+        card_id = self._card_id_by_chat.get(chat_id)
+        if not card_id or not self._client:
+            return False
+        seq = self._card_seq.get(chat_id, 0) + 1
+        try:
+            from lark_oapi.api.cardkit.v1 import UpdateCardRequest, UpdateCardRequestBody
+            body = (
+                UpdateCardRequestBody.builder()
+                .card(json.dumps(card, ensure_ascii=False))
+                .sequence(seq)
+                .build()
+            )
+            request = UpdateCardRequest.builder().card_id(card_id).request_body(body).build()
+            response = await self._run_blocking(self._client.cardkit.v1.card.update, request)
+            if not getattr(response, "success", lambda: False)():
+                logger.info("[Feishu] cardkit update failed: %s", getattr(response, "msg", ""))
+                return False
+            self._card_seq[chat_id] = seq
+            return True
+        except Exception:
+            logger.debug("[Feishu] cardkit update error", exc_info=True)
+            return False
+
     async def begin_turn_card(self, chat_id: str, reply_to: Optional[str] = None,
                               metadata: Optional[dict[str, Any]] = None,
                               internal: bool = False) -> Optional[str]:
@@ -2309,6 +2428,11 @@ class FeishuAdapter(BasePlatformAdapter):
         )
         payload = json.dumps(card, ensure_ascii=False)
         try:
+            # Prefer a CardKit entity: posting a reference to it lets later updates patch a
+            # single element instead of resending the whole card. Fall back to a plain card.
+            _card_id = await self._cardkit_create_card(card)
+            if _card_id:
+                payload = json.dumps({"type": "card", "data": {"card_id": _card_id}}, ensure_ascii=False)
             response = await self._feishu_send_with_retry(
                 chat_id=chat_id, msg_type="interactive", payload=payload,
                 reply_to=reply_to, metadata=metadata,
@@ -2316,6 +2440,9 @@ class FeishuAdapter(BasePlatformAdapter):
             result = self._finalize_send_result(response, "turn card send failed")
             if not (result.success and result.message_id):
                 return None
+            if _card_id:
+                self._card_id_by_chat[chat_id] = _card_id
+                self._card_seq[chat_id] = 0
             self._remember_progress_card(result.message_id)
             self._progress_card_by_chat[chat_id] = result.message_id
             self._progress_card_bodies[result.message_id] = ""
@@ -2340,13 +2467,23 @@ class FeishuAdapter(BasePlatformAdapter):
                     continue
                 # Fixed cadence so the timer visibly ticks while a long tool or sub-agent runs;
                 # the idle age only changes the wording (60s soft, 180s stall warning).
+                # Cheap path: only the status strip (and sub-agent rows) changed, so patch those
+                # elements instead of resending the whole card.
+                _label = self._status_label(chat_id, idle=idle)
+                if await self._cardkit_patch_element(chat_id, "status", {"content": _label}):
+                    if self._subagents.get(chat_id):
+                        await self._cardkit_patch_element(
+                            chat_id, "subagents",
+                            {"content": "\n".join(self._subagent_lines(chat_id))},
+                        )
+                    self._last_progress_at[chat_id] = time.time()
+                    continue
                 card = _build_progress_card(
                     self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
                     count=self._progress_card_counts.get(message_id, 0),
-                    final_text=self._final_card_text.get(message_id),
+                    status_label=_label,
                     bg_tasks=self._bg_task_card_tasks.get(chat_id),
                     subagents=self._subagent_lines(chat_id),
-                    status_label=self._status_label(chat_id, idle=idle),
                 )
                 payload = json.dumps(card, ensure_ascii=False)
                 if len(payload.encode("utf-8")) > 28000:
@@ -2417,6 +2554,8 @@ class FeishuAdapter(BasePlatformAdapter):
                 folded_payload = json.dumps(card, ensure_ascii=False)
                 # Feishu caps a card update at 30 KB; fall through to a standalone card past that.
                 if len(folded_payload.encode("utf-8")) <= 28000:
+                    if await self._cardkit_update_card(chat_id, card):
+                        return SendResult(success=True, message_id=folded_id)
                     request_body = self._build_update_message_body(msg_type=None, content=folded_payload)
                     request = self._build_update_message_request(message_id=folded_id, request_body=request_body)
                     patch = getattr(HttpMethod, "PATCH", None)
@@ -2478,6 +2617,16 @@ class FeishuAdapter(BasePlatformAdapter):
         content = self.format_message(content)
 
         async def _update(msg_type: Optional[str], payload: str, *, method: Any = None) -> SendResult:
+            # Card updates go through the CardKit entity when this chat's card has one: same
+            # content, sequence-guarded, no message rewrite.
+            if msg_type is None:
+                try:
+                    _card_obj = json.loads(payload)
+                    if isinstance(_card_obj, dict) and _card_obj.get("schema"):
+                        if await self._cardkit_update_card(chat_id, _card_obj):
+                            return SendResult(success=True, message_id=message_id)
+                except Exception:
+                    logger.debug("[Feishu] cardkit update path skipped", exc_info=True)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
             if method is not None:
