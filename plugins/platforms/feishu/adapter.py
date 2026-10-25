@@ -1647,6 +1647,8 @@ class FeishuAdapter(BasePlatformAdapter):
         self._card_seq = _CARD_SEQ
         # Start of the turn currently owning this chat's card, for the footer duration.
         self._turn_started_at: dict[str, float] = {}
+        # Last time the card content actually changed: the heartbeat is a 10s fallback only.
+        self._last_card_update_at: dict[str, float] = {}
         self._loop: Any = None
         self._load_seen_message_ids()
 
@@ -2397,6 +2399,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.info("[Feishu] cardkit patch %s failed: %s", element_id, getattr(response, "msg", ""))
                 return False
             self._card_seq[chat_id] = seq
+            self._last_card_update_at[chat_id] = time.time()
             return True
         except Exception:
             logger.debug("[Feishu] cardkit patch error", exc_info=True)
@@ -2422,6 +2425,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 logger.info("[Feishu] cardkit update failed: %s", getattr(response, "msg", ""))
                 return False
             self._card_seq[chat_id] = seq
+            self._last_card_update_at[chat_id] = time.time()
             return True
         except Exception:
             logger.debug("[Feishu] cardkit update error", exc_info=True)
@@ -2499,15 +2503,17 @@ class FeishuAdapter(BasePlatformAdapter):
         started = time.time()
         try:
             while True:
-                await asyncio.sleep(10)
+                await asyncio.sleep(2)
                 if self._progress_card_by_chat.get(chat_id) != message_id:
                     return
-                idle = time.time() - self._last_progress_at.get(chat_id, started)
                 if (self._agent_status.get(chat_id) or {}).get("state") == "waiting":
                     # Blocked on the user: not a stall, and no ticking.
                     continue
-                # Fixed cadence so the timer visibly ticks while a long tool or sub-agent runs;
-                # the idle age only changes the wording (60s soft, 180s stall warning).
+                # Fallback only: every content update already carries the elapsed time, so
+                # refresh just when nothing has touched the card for 10 seconds.
+                if time.time() - self._last_card_update_at.get(chat_id, started) < 10:
+                    continue
+                idle = time.time() - self._last_progress_at.get(chat_id, started)
                 # Cheap path: only the status strip (and sub-agent rows) changed, so patch those
                 # elements instead of resending the whole card.
                 _label = self._status_label(chat_id, idle=idle)
