@@ -1901,6 +1901,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         formatted, count=_progress_tool_count(metadata),
                         reply_open_id=_progress_reply_open_id(metadata),
                         bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                        status_label="工具调用中",
                     ), ensure_ascii=False,
                 )
                 response = await self._feishu_send_with_retry(
@@ -2034,23 +2035,24 @@ class FeishuAdapter(BasePlatformAdapter):
             task.cancel()
 
     async def _progress_heartbeat_loop(self, chat_id: str, message_id: str) -> None:
+        """Idle-only heartbeat: stay silent while callbacks keep the card fresh, and emit one
+        tick only after 60s without any update so the chat can tell the agent is still alive."""
         started = time.time()
         try:
             while True:
-                await asyncio.sleep(10)
+                await asyncio.sleep(5)
                 if self._progress_card_by_chat.get(chat_id) != message_id:
                     return
-                elapsed = int(time.time() - started)
                 idle = time.time() - self._last_progress_at.get(chat_id, started)
-                # A tool that reported within the last 8s means one is running; otherwise the
-                # model is generating. Either way the counter proves the agent is still alive.
-                label = f"工具调用中 · {elapsed}s" if idle < 8 else f"思考中 · {elapsed}s"
+                if idle < 60:
+                    continue
+                elapsed = int(time.time() - started)
                 card = _build_progress_card(
                     self._progress_card_bodies.get(message_id, ""),
                     count=self._progress_card_counts.get(message_id, 0),
                     final_text=self._final_card_text.get(message_id),
                     bg_tasks=self._bg_task_card_tasks.get(chat_id),
-                    status_label=label,
+                    status_label=f"思考中 · {elapsed}s",
                 )
                 payload = json.dumps(card, ensure_ascii=False)
                 if len(payload.encode("utf-8")) > 28000:
@@ -2063,6 +2065,7 @@ class FeishuAdapter(BasePlatformAdapter):
                 response = await self._run_blocking(self._client.im.v1.message.update, request)
                 if not self._finalize_send_result(response, "heartbeat update failed").success:
                     return
+                self._last_progress_at[chat_id] = time.time()
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -2197,6 +2200,7 @@ class FeishuAdapter(BasePlatformAdapter):
                         content, count=_progress_tool_count(metadata),
                         reply_open_id=_progress_reply_open_id(metadata),
                         bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                        status_label="工具调用中",
                     ), ensure_ascii=False,
                 )
                 result = await _update(None, card_payload, method=getattr(HttpMethod, "PATCH", None))
