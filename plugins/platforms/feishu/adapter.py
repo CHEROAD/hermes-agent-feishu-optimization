@@ -1342,7 +1342,7 @@ def _progress_reply_open_id(metadata: Optional[dict[str, Any]]) -> Optional[str]
 
 def _build_progress_card(
     content: str, *, expanded: bool = False, count: int = 0, final_text: Optional[str] = None,
-    reply_open_id: Optional[str] = None,
+    reply_open_id: Optional[str] = None, bg_tasks: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     """Collapsible tool-progress card, optionally carrying the turn's final answer.
 
@@ -1374,6 +1374,10 @@ def _build_progress_card(
             "elements": [{"tag": "markdown", "content": body}],
         }
     ]
+    if bg_tasks:
+        # Sits between the tool panel and the final answer, so a turn reads top-down:
+        # tools → background jobs → reply.
+        elements.append(_bg_panel_element(bg_tasks))
     if final_text:
         elements.append({
             "tag": "markdown",
@@ -1388,12 +1392,11 @@ def _build_progress_card(
     }
 
 
-def _build_background_tasks_card(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+def _bg_panel_element(tasks: list[dict[str, Any]]) -> dict[str, Any]:
     """Collapsible background-task panel: one row per task with status, exit code and duration.
 
-    Replaces the per-task "✅ Background task finished" chat message on Feishu: the same card is
-    created when a job starts and patched in place as jobs run and finish, so a chat accumulates
-    a single panel instead of one bubble per job.
+    Shared by the standalone background card and the tool-progress card (which carries it
+    between the tool panel and the turn's final answer, so a whole turn stays one bubble).
     """
     running = sum(1 for t in tasks if t.get("status") == "running")
     failed = sum(1 for t in tasks if t.get("status") == "failed")
@@ -1419,32 +1422,34 @@ def _build_background_tasks_card(tasks: list[dict[str, Any]]) -> dict[str, Any]:
         suffix = f" · {' · '.join(meta)}" if meta else ""
         lines.append(f"{icon} `{command}`{suffix}")
     body = "\n".join(lines) or "…"
-    elements: list[dict[str, Any]] = [
-        {
-            "tag": "collapsible_panel",
-            "expanded": bool(running),
-            "header": {
-                "title": {"tag": "plain_text", "content": title},
-                "vertical_align": "center",
-                "icon": {
-                    "tag": "standard_icon",
-                    "token": "down-small-ccm_outlined",
-                    "color": "",
-                    "size": "16px 16px",
-                },
-                "icon_position": "right",
-                "icon_expanded_angle": -180,
+    return {
+        "tag": "collapsible_panel",
+        "expanded": bool(running),
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "vertical_align": "center",
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down-small-ccm_outlined",
+                "color": "",
+                "size": "16px 16px",
             },
-            "border": {"color": "grey", "corner_radius": "5px"},
-            "vertical_spacing": "8px",
-            "padding": "8px 8px 8px 8px",
-            "elements": [{"tag": "markdown", "content": body}],
-        }
-    ]
+            "icon_position": "right",
+            "icon_expanded_angle": -180,
+        },
+        "border": {"color": "grey", "corner_radius": "5px"},
+        "vertical_spacing": "8px",
+        "padding": "8px 8px 8px 8px",
+        "elements": [{"tag": "markdown", "content": body}],
+    }
+
+
+def _build_background_tasks_card(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Standalone background-task card, used when the chat has no progress card to fold into."""
     return {
         "schema": "2.0",
         "config": {"wide_screen_mode": True},
-        "body": {"elements": elements},
+        "body": {"elements": [_bg_panel_element(tasks)]},
     }
 
 
@@ -1553,6 +1558,10 @@ class FeishuAdapter(BasePlatformAdapter):
         # finished background job updates that panel instead of sending its own chat message.
         self._bg_task_card_by_chat: dict[str, str] = {}
         self._bg_task_card_tasks: dict[str, list[dict[str, Any]]] = OrderedDict()
+        # Last finished turn's card per chat: a later background-task update patches that same
+        # bubble (tools → jobs → reply) instead of appending a new message below the reply.
+        self._final_card_by_chat: dict[str, str] = {}
+        self._final_card_text: dict[str, str] = {}
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1882,6 +1891,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     _build_progress_card(
                         formatted, count=_progress_tool_count(metadata),
                         reply_open_id=_progress_reply_open_id(metadata),
+                        bg_tasks=self._bg_task_card_tasks.get(chat_id),
                     ), ensure_ascii=False,
                 )
                 response = await self._feishu_send_with_retry(
@@ -1966,6 +1976,7 @@ class FeishuAdapter(BasePlatformAdapter):
         card = _build_progress_card(
             body, count=self._progress_card_counts.get(message_id, 0), final_text=text,
             reply_open_id=_progress_reply_open_id(metadata),
+            bg_tasks=self._bg_task_card_tasks.get(chat_id),
         )
         payload = json.dumps(card, ensure_ascii=False)
         # Feishu caps a card update at 30 KB; fall back to a normal send past that.
@@ -1979,7 +1990,12 @@ class FeishuAdapter(BasePlatformAdapter):
             if patch is not None:
                 request.http_method = patch
             response = await self._run_blocking(self._client.im.v1.message.update, request)
-            return bool(self._finalize_send_result(response, "final append failed").success)
+            ok = bool(self._finalize_send_result(response, "final append failed").success)
+            if ok:
+                # Remember the answer so a later background-task patch rebuilds the same
+                # tools → jobs → reply card instead of emitting a new bubble.
+                self._final_card_text[message_id] = text
+            return ok
         except Exception as exc:
             logger.warning("[Feishu] Folding the final answer into the progress card failed: %s", exc)
             return False
@@ -1988,24 +2004,58 @@ class FeishuAdapter(BasePlatformAdapter):
             self.clear_progress_card(chat_id)
 
     def clear_progress_card(self, chat_id: str) -> None:
-        """Forget the chat's live progress card (turn ended or delivery handled elsewhere)."""
+        """Retire the chat's live progress card but keep it as the turn's final bubble.
+
+        Background-task updates later patch this same card, so the order stays
+        tools → background jobs → reply instead of appending a new message below the answer.
+        """
         message_id = self._progress_card_by_chat.pop(chat_id, None)
-        if message_id:
-            self._progress_card_bodies.pop(message_id, None)
+        if not message_id:
+            return
+        old = self._final_card_by_chat.get(chat_id)
+        if old and old != message_id:
+            self._progress_card_bodies.pop(old, None)
+            self._final_card_text.pop(old, None)
+        self._final_card_by_chat[chat_id] = message_id
 
     async def update_background_tasks_card(self, chat_id: str, tasks: list[dict[str, Any]]) -> SendResult:
-        """Create-or-patch the chat's single background-task panel.
+        """Fold background-task status into the chat's turn card, between tools and the reply.
 
-        Replaces the per-job "✅ Background task finished" bubble: the first task creates the
-        card, later status changes patch it in place. The caller skips its own message once this
-        returns success.
+        Patches the live progress card, else the last finished turn's card, so the panel always
+        lands between the tool list and the answer. Creates a standalone card only when the chat
+        has no turn card at all.
         """
         if not self._client:
             return SendResult(success=False, error="Not connected")
         self._bg_task_card_tasks[chat_id] = list(tasks)
         try:
+            folded_id = self._progress_card_by_chat.get(chat_id) or self._final_card_by_chat.get(chat_id)
+            if folded_id and (folded_id in self._progress_card_bodies or folded_id in self._final_card_text):
+                card = _build_progress_card(
+                    self._progress_card_bodies.get(folded_id, ""),
+                    count=self._progress_card_counts.get(folded_id, 0),
+                    final_text=self._final_card_text.get(folded_id),
+                    bg_tasks=tasks,
+                )
+                folded_payload = json.dumps(card, ensure_ascii=False)
+                # Feishu caps a card update at 30 KB; fall through to a standalone card past that.
+                if len(folded_payload.encode("utf-8")) <= 28000:
+                    request_body = self._build_update_message_body(msg_type=None, content=folded_payload)
+                    request = self._build_update_message_request(message_id=folded_id, request_body=request_body)
+                    patch = getattr(HttpMethod, "PATCH", None)
+                    if patch is not None:
+                        request.http_method = patch
+                    response = await self._run_blocking(self._client.im.v1.message.update, request)
+                    result = self._finalize_send_result(response, "turn card update failed")
+                    if result.success:
+                        result.message_id = folded_id
+                        return result
+                    logger.info("[Feishu] folding background tasks into the turn card failed: %s", result.error)
+                    if self._final_card_by_chat.get(chat_id) == folded_id:
+                        self._final_card_by_chat.pop(chat_id, None)
             payload = json.dumps(_build_background_tasks_card(tasks), ensure_ascii=False)
         except Exception as exc:
+            logger.warning("[Feishu] background task card build failed: %s", exc)
             return SendResult(success=False, error=str(exc))
         message_id = self._bg_task_card_by_chat.get(chat_id)
         if message_id:
@@ -2070,6 +2120,7 @@ class FeishuAdapter(BasePlatformAdapter):
                     _build_progress_card(
                         content, count=_progress_tool_count(metadata),
                         reply_open_id=_progress_reply_open_id(metadata),
+                        bg_tasks=self._bg_task_card_tasks.get(chat_id),
                     ), ensure_ascii=False,
                 )
                 result = await _update(None, card_payload, method=getattr(HttpMethod, "PATCH", None))
