@@ -1653,6 +1653,12 @@ class FeishuAdapter(BasePlatformAdapter):
         self._turn_ended_at: dict[str, float] = {}
         # Last time the card content actually changed: the heartbeat is a 10s fallback only.
         self._last_card_update_at: dict[str, float] = {}
+        # Serializes "allocate sequence -> PATCH -> await response" for this card.
+        # The module-level _CARD_LOCK only guarantees unique numbers, NOT arrival order: two
+        # in-flight patches can reach Feishu out of order, and the older one is rejected with
+        # "sequence number compare failed". Holding this lock across the request keeps
+        # allocation order == delivery order.
+        self._card_patch_lock: Any = None
         self._loop: Any = None
         self._load_seen_message_ids()
 
@@ -2186,6 +2192,14 @@ class FeishuAdapter(BasePlatformAdapter):
         finally:
             self.clear_progress_card(chat_id)
 
+    def _get_card_patch_lock(self):
+        """Lazily create the per-adapter patch lock inside the running event loop."""
+        lock = self._card_patch_lock
+        if lock is None:
+            lock = asyncio.Lock()
+            self._card_patch_lock = lock
+        return lock
+
     def _start_progress_heartbeat(self, chat_id: str, message_id: str) -> None:
         """Tick the progress card every 10s so a long think or tool run never looks stuck."""
         task = self._heartbeat_tasks.get(chat_id)
@@ -2558,6 +2572,7 @@ class FeishuAdapter(BasePlatformAdapter):
         """Idle-only heartbeat: stays silent while callbacks keep the card fresh, then re-renders
         it with the activity age — amber past 60s, red past 3 minutes."""
         started = time.time()
+        fails = 0
         try:
             while True:
                 await asyncio.sleep(2)
@@ -2590,9 +2605,25 @@ class FeishuAdapter(BasePlatformAdapter):
                 patch = getattr(HttpMethod, "PATCH", None)
                 if patch is not None:
                     request.http_method = patch
-                response = await self._run_blocking(self._client.im.v1.message.update, request)
+                async with self._get_card_patch_lock():
+                    response = await self._run_blocking(self._client.im.v1.message.update, request)
                 if not self._finalize_send_result(response, "heartbeat update failed").success:
-                    return
+                    # A single failed patch must NOT kill the heartbeat. The common case is
+                    # CardKit "sequence number compare failed": a content/status patch that was
+                    # allocated a higher sequence overtook us in flight, so the server already
+                    # applied a newer revision. That is a lost race, not a dead card — stamp the
+                    # update time (so we don't retry every 2s), back off, and keep the loop alive.
+                    self._last_card_update_at[chat_id] = time.time()
+                    fails += 1
+                    if fails > 12:
+                        logger.info(
+                            "[Feishu] heartbeat giving up after %d consecutive failures (chat=%s)",
+                            fails, chat_id,
+                        )
+                        return
+                    await asyncio.sleep(min(2 ** min(fails, 4), 20))
+                    continue
+                fails = 0
                 self._last_progress_at[chat_id] = time.time()
                 self._last_card_update_at[chat_id] = time.time()
         except asyncio.CancelledError:
