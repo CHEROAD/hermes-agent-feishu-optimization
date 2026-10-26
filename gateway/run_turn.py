@@ -234,6 +234,11 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
         if not isinstance(prepared, self._PreparedTurn):
             return prepared
         history, message_text = prepared.history, prepared.message_text
+        # Explicit defaults for the finally block below, which decides whether this turn
+        # delivered anything. Reading locals() by name would break silently on a rename.
+        agent_result: Any = None
+        response: Any = None
+        _intentional_silence = False
 
         try:
             hook_ctx = {
@@ -366,13 +371,11 @@ class GatewayTurnMixin(GatewayTurnPrepareMixin, GatewayTurnHygieneMixin, Gateway
             # restart, the agent raised — and that card would keep its spinner for good, which
             # reads in chat as "stuck, no reply". Close it only when NOTHING went out this turn.
             try:
-                _result = locals().get("agent_result")
-                _out = locals().get("response")
                 _delivered = bool(
-                    (isinstance(_out, str) and _out.strip())
-                    or (isinstance(_result, dict) and _result.get("already_sent"))
+                    (isinstance(response, str) and response.strip())
+                    or (isinstance(agent_result, dict) and agent_result.get("already_sent"))
                     # A muted notice turn is deliberately silent — not a dropped answer.
-                    or locals().get("_intentional_silence")
+                    or _intentional_silence
                 )
                 if (not _delivered and source.platform == Platform.FEISHU
                         and getattr(source, "chat_id", None)):

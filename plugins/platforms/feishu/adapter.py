@@ -1347,6 +1347,10 @@ _CARD_SEQ: dict[str, int] = {}
 # Heartbeat, status refresh and tool progress can race for the same card: allocate the
 # sequence under a lock so two updates never send the same number.
 _CARD_LOCK = threading.Lock()
+# Serializes "allocate sequence -> send -> await" across ALL adapter instances: the module
+# lock only makes numbers unique, not arrival order, and an injected notice can be routed
+# through a different adapter instance than the one that opened the card.
+_CARD_PATCH_LOCK = asyncio.Lock()
 
 
 def _fmt_elapsed(seconds: float) -> str:
@@ -2187,18 +2191,25 @@ class FeishuAdapter(BasePlatformAdapter):
             )
             if await self._cardkit_update_card(chat_id, card):
                 self._final_card_text[message_id] = text
+            else:
+                # A CardKit outage must not leave the spinner behind: fall back to the message PATCH.
+                _payload = json.dumps(card, ensure_ascii=False)
+                _body = self._build_update_message_body(msg_type=None, content=_payload)
+                _req = self._build_update_message_request(message_id=message_id, request_body=_body)
+                _patch = getattr(HttpMethod, "PATCH", None)
+                if _patch is not None:
+                    _req.http_method = _patch
+                _resp = await self._run_blocking(self._client.im.v1.message.update, _req)
+                if self._finalize_send_result(_resp, "abandoned card patch failed").success:
+                    self._final_card_text[message_id] = text
         except Exception:
             logger.debug("[Feishu] closing an abandoned turn card failed", exc_info=True)
         finally:
             self.clear_progress_card(chat_id)
 
     def _get_card_patch_lock(self):
-        """Lazily create the per-adapter patch lock inside the running event loop."""
-        lock = self._card_patch_lock
-        if lock is None:
-            lock = asyncio.Lock()
-            self._card_patch_lock = lock
-        return lock
+        """The shared patch lock: allocation order must equal delivery order."""
+        return _CARD_PATCH_LOCK
 
     def _start_progress_heartbeat(self, chat_id: str, message_id: str) -> None:
         """Tick the progress card every 10s so a long think or tool run never looks stuck."""
@@ -2446,7 +2457,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     .request_body(body)
                     .build()
                 )
-                response = await self._run_blocking(self._client.cardkit.v1.card_element.patch, request)
+                async with _CARD_PATCH_LOCK:
+                    response = await self._run_blocking(self._client.cardkit.v1.card_element.patch, request)
                 if getattr(response, "success", lambda: False)():
                     self._last_card_update_at[chat_id] = time.time()
                     return True
@@ -2483,7 +2495,8 @@ class FeishuAdapter(BasePlatformAdapter):
                     .build()
                 )
                 request = UpdateCardRequest.builder().card_id(card_id).request_body(body).build()
-                response = await self._run_blocking(self._client.cardkit.v1.card.update, request)
+                async with _CARD_PATCH_LOCK:
+                    response = await self._run_blocking(self._client.cardkit.v1.card.update, request)
                 if getattr(response, "success", lambda: False)():
                     self._last_card_update_at[chat_id] = time.time()
                     return True
