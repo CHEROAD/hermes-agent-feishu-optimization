@@ -30,6 +30,8 @@ class FeishuChoiceCardsMixin:
         ("hermes_update_prompt_action", "_handle_update_prompt_card_action"),
         ("hermes_clarify_action", "_handle_clarify_card_action"),
         ("hermes_choice_picker_action", "_handle_choice_picker_card_action"),
+        # Turn-card stop button: dispatched as a synthetic /stop (see the Feishu adapter).
+        ("hermes_stop_action", "_handle_stop_card_action"),
     )
 
     def _init_choice_card_state(self) -> None:

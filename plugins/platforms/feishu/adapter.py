@@ -78,6 +78,7 @@ _LARK_SDK_IMPORTS = (
 )
 lark = FeishuWSClient = None  # type: ignore[assignment]
 globals().update({name: None for _, names in _LARK_SDK_IMPORTS for name in names})
+CallBackToast: Any = globals().get("CallBackToast")  # declared for type checkers; re-bound by the lazy import
 FEISHU_AVAILABLE = False
 _lark_import_lock = threading.Lock()
 
@@ -225,6 +226,8 @@ FALLBACK_ATTACHMENT_TEXT = "[Attachment]"
 _PREFERRED_LOCALES = ("zh_cn", "en_us")
 _MARKDOWN_SPECIAL_CHARS_RE = re.compile(r"([\\`*_{}\[\]()#+\-!|>~])")
 _MENTION_PLACEHOLDER_RE = re.compile(r"@_user_\d+")
+# ``<at user_id="ou_xxx">名字</at>`` — also matches the placeholder form the gateway emits.
+_CARD_AT_NODE_RE = re.compile(r'<at\s+user_id="([^"]*)"[^>]*>(.*?)</at>', re.DOTALL)
 _MENTION_BOUNDARY_CHARS = frozenset(" \t\n\r.,;:!?、，。；：！？()[]{}<>\"'`")
 _TRAILING_TERMINAL_PUNCT = frozenset(" \t\n\r.!?。！？")
 _WHITESPACE_RE = re.compile(r"\s+")
@@ -324,6 +327,10 @@ class FeishuAdapterSettings:
     default_group_policy: str = ""
     group_rules: dict[str, FeishuGroupRule] = field(default_factory=dict)
     allow_bots: str = "none"  # "none" | "mentions" | "all"
+    # Who may press the turn card's stop button: "all" (anyone the gateway authorizes to talk to
+    # this chat), "starter_admin" (admins/allowed users only) or "starter" (the person whose
+    # message opened the turn, admins always). Mirrored as ``self._stop_button_scope``.
+    stop_button_scope: str = "all"
     require_mention: bool = True
     allow_all_dm: bool = False  # resolved per-profile so multiplexed adapters honor their own .env
 
@@ -1262,12 +1269,300 @@ def _build_lark_client(app_id: str, app_secret: str, sdk_domain: Any) -> Any:
     return lark.Client.builder().app_id(app_id).app_secret(app_secret).domain(sdk_domain).log_level(lark.LogLevel.WARNING).build()
 
 
+def _folded_progress_enabled() -> bool:
+    """Feishu-only: render tool progress as a collapsed interactive card (one row, click to expand)."""
+    raw = os.environ.get("HERMES_FEISHU_FOLDED_PROGRESS", "1")
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _is_progress_card_request(metadata: Optional[dict[str, Any]]) -> bool:
+    """True when the gateway marked this send as tool progress and the fold feature is on."""
+    return bool(metadata and metadata.get("feishu_progress_card")) and _folded_progress_enabled()
+
+
+def _trim_progress_body(body: str, limit: int = 6000) -> str:
+    """Keep the newest complete lines of a progress transcript.
+
+    Feishu rejects oversized card payloads, so long transcripts must be trimmed. Trimming by
+    lines (and re-balancing code fences) avoids the broken rendering you get from slicing a
+    fenced block mid-way.
+    """
+    if len(body) <= limit:
+        return body
+    kept = body[-limit:]
+    # Start on a line boundary unless that would lose almost everything.
+    newline = kept.find("\n")
+    if 0 <= newline < len(kept) // 2:
+        kept = kept[newline + 1:]
+    # An odd number of fences means the cut landed inside a code block; drop up to the next one.
+    if kept.count("```") % 2 == 1:
+        fence = kept.find("```")
+        if fence >= 0:
+            kept = kept[fence + 3:]
+    return "…（更早的记录已省略）\n" + kept
+
+
+def _sanitize_card_text(text: str, reply_open_id: Optional[str] = None) -> str:
+    """Rewrite @-mentions into a form Card JSON accepts.
+
+    Card JSON rejects an ``at`` node whose ``user_id`` is Feishu's inbound placeholder
+    (``@_user_N`` / ``@_all``) with 230099 / ErrCode 100290 "invalid user resource", which
+    kills the whole card and silently falls back to a plain message.
+
+    The gateway hands us placeholders, so the first one — normally the person being replied
+    to — is upgraded to a real ``<at id=ou_...>`` node when ``reply_open_id`` is known, which
+    keeps the notification. Any further placeholder degrades to plain ``@名字`` text (we have
+    no id for it, and reusing one open_id would notify the wrong people).
+    """
+    if not text or "<at" not in text:
+        return text
+
+    used_real_id = False
+
+    def _sub(match: re.Match[str]) -> str:
+        nonlocal used_real_id
+        raw_id = match.group(1) or ""
+        label = (match.group(2) or "").strip()
+        if not (raw_id.startswith("@_user_") or raw_id == "@_all"):
+            return match.group(0)  # a real open_id — leave the at node intact
+        if not used_real_id and reply_open_id:
+            used_real_id = True
+            return f"<at id={reply_open_id}></at>"
+        if label:
+            return f"@{label}"
+        return "@所有人" if raw_id == "@_all" else ""
+
+    return _CARD_AT_NODE_RE.sub(_sub, text)
+
+
+def _progress_tool_count(metadata: Optional[dict[str, Any]]) -> int:
+    """Running tool count the gateway attaches to progress sends (0 when absent)."""
+    try:
+        return int((metadata or {}).get("progress_tool_count") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _progress_reply_open_id(metadata: Optional[dict[str, Any]]) -> Optional[str]:
+    """Open_id of the person this turn replies to, for a real @ node in the card."""
+    value = (metadata or {}).get("reply_open_id")
+    return str(value) if value else None
+
+
+# Shared across adapter instances: the gateway can route a send through a different instance
+# than the one that opened the turn card, and the CardKit entity must still be reachable.
+_CARD_IDS: dict[str, str] = {}
+_CARD_SEQ: dict[str, int] = {}
+# Heartbeat, status refresh and tool progress can race for the same card: allocate the
+# sequence under a lock so two updates never send the same number.
+_CARD_LOCK = threading.Lock()
+# Serializes "allocate sequence -> send -> await" across ALL adapter instances: the module
+# lock only makes numbers unique, not arrival order, and an injected notice can be routed
+# through a different adapter instance than the one that opened the card.
+_CARD_PATCH_LOCK = asyncio.Lock()
+
+
+def _fmt_elapsed(seconds: float) -> str:
+    """Compact duration: 45s, 1m23s, 1h02m03s."""
+    total = max(0, int(seconds))
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    if minutes < 60:
+        return f"{minutes}m{secs:02d}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h{minutes:02d}m{secs:02d}s"
+
+
+_TOOL_ROW_RE = re.compile(r"^\s*(?:┊\s*)?[💻🔀📖🌐📝🔧⚡🧪🎨📦🔍🤝📄🛠]")
+
+
+def _build_progress_card(
+    content: str, *, expanded: bool = False, count: int = 0, final_text: Optional[str] = None,
+    reply_open_id: Optional[str] = None, bg_tasks: Optional[list[dict[str, Any]]] = None,
+    status_label: Optional[str] = None, subagents: Optional[list[str]] = None,
+    elapsed_s: Optional[float] = None, finished_at: Optional[float] = None,
+    stop_value: Optional[dict[str, Any]] = None, stopped: bool = False,
+) -> dict[str, Any]:
+    """Collapsible tool-progress card, optionally carrying the turn's final answer.
+
+    Collapsed it costs a single line in the chat; the full transcript stays inside the panel
+    and keeps being replaced in place as the turn progresses. Passing ``final_text`` appends
+    the answer below the panel so a whole turn occupies one message.
+    """
+    title = f"🔧 工具调用 ({count})" if count > 0 else "🔧 工具调用"
+    body = _trim_progress_body(_sanitize_card_text(content) or "准备中…")
+    elements: list[dict[str, Any]] = []
+    # The panel needs both a call count and real rows: a pre-tool turn reports one progress
+    # line but no content, and must not render an empty 准备中… panel.
+    if count > 0 and content and content.strip():
+        elements.append({
+            "tag": "collapsible_panel",
+            "element_id": "tools_panel",
+            "expanded": bool(expanded),
+            "header": {
+                "title": {"tag": "plain_text", "content": title},
+                "vertical_align": "center",
+                "icon": {
+                    "tag": "standard_icon",
+                    "token": "down-small-ccm_outlined",
+                    "color": "",
+                    "size": "16px 16px",
+                },
+                "icon_position": "right",
+                "icon_expanded_angle": -180,
+            },
+            "border": {"color": "grey", "corner_radius": "5px"},
+            "vertical_spacing": "8px",
+            "padding": "8px 8px 8px 8px",
+            "elements": [{"tag": "markdown", "element_id": "tools_body", "content": body}],
+        })
+    if bg_tasks:
+        # Sits between the tool panel and the final answer, so a turn reads top-down:
+        # tools → background jobs → reply.
+        _bg_el = _bg_panel_element(bg_tasks)
+        _bg_el["element_id"] = "bg_panel"
+        elements.append(_bg_el)
+    if status_label and not final_text:
+        # Its own strip at the bottom of the card: tools → background jobs → live status.
+        if elements:
+            elements.append({"tag": "hr", "element_id": "status_sep"})
+        elements.append({
+            "tag": "markdown",
+            "element_id": "status",
+            "content": status_label,
+            "text_align": "left",
+        })
+    if subagents and not final_text:
+        # One row per sub-agent, below the main status.
+        elements.append({
+            "tag": "markdown",
+            "element_id": "subagents",
+            "content": "\n".join(subagents),
+            "text_align": "left",
+        })
+    if stop_value and not final_text:
+        # Interactive stop: one danger button that dispatches /stop for this turn. The value
+        # carries chat_id + turn id so a stale card (an earlier turn, or another chat's card)
+        # can refuse the click instead of stopping whatever happens to be running now.
+        # Card 2.0 rejects the 1.0 ``action`` container ("cards of schema V2 no longer support
+        # this capability ... unsupported tag action"), so the button is a direct body element
+        # and the callback rides in ``behaviors``.
+        elements.append({
+            "tag": "button",
+            "element_id": "stop_btn",
+            "text": {"tag": "plain_text", "content": "⏹ 停止"},
+            "type": "danger",
+            "behaviors": [{"type": "callback", "value": stop_value}],
+        })
+    if final_text:
+        elements.append({
+            "tag": "markdown",
+            "element_id": "final",
+            "content": _sanitize_card_text(final_text, reply_open_id),
+        })
+    if elapsed_s is not None:
+        # Bottom line of the card: how long this turn has been running (or took, once done).
+        # The wording flips the moment the final answer is folded in: a live turn reports
+        # "已耗时" (still counting), a finished one "总耗时" plus the wall-clock time it ended.
+        if elements:
+            elements.append({"tag": "hr", "element_id": "footer_sep"})
+        _duration = "<1s" if elapsed_s < 1 else _fmt_elapsed(elapsed_s)
+        if final_text:
+            _ended = finished_at if finished_at is not None else time.time()
+            _footer = f"⏱ 总耗时 {_duration} · {time.strftime('%H:%M', time.localtime(_ended))}"
+            if stopped:
+                # The stop button ended this turn early: say so on the finished card instead of
+                # leaving a card that looks like it produced an answer on its own.
+                _footer += " · 已停止"
+        else:
+            _footer = f"⏳ 已耗时 {_duration}"
+        elements.append({
+            "tag": "markdown",
+            "element_id": "footer",
+            "content": _footer,
+        })
+    # Card JSON 2.0: headings, quotes and TABLES only render in the 2.0 structure; the 1.0
+    # shape silently flattens them to plain text.
+    return {
+        "schema": "2.0",
+        # update_multi is required for CardKit element-level patches on the same entity.
+        "config": {"width_mode": "fill", "update_multi": True},
+        "body": {"elements": elements},
+    }
+
+
+def _bg_panel_element(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Collapsible background-task panel: one row per task with status, exit code and duration.
+
+    Shared by the standalone background card and the tool-progress card (which carries it
+    between the tool panel and the turn's final answer, so a whole turn stays one bubble).
+    """
+    running = sum(1 for t in tasks if t.get("status") == "running")
+    failed = sum(1 for t in tasks if t.get("status") == "failed")
+    done = sum(1 for t in tasks if t.get("status") == "done")
+    parts = []
+    if running:
+        parts.append(f"{running} 运行中")
+    if failed:
+        parts.append(f"{failed} 失败")
+    if done:
+        parts.append(f"{done} 完成")
+    title = "⚙️ 后台任务" + (f" · {' / '.join(parts)}" if parts else "")
+    lines: list[str] = []
+    for t in tasks[-12:]:
+        status = t.get("status")
+        icon = {"running": "🟢", "done": "✅", "failed": "❌"}.get(status, "⚪")
+        command = _sanitize_card_text(str(t.get("command") or t.get("id") or "?"))
+        meta: list[str] = []
+        if isinstance(t.get("exit_code"), int):
+            meta.append(f"exit {t['exit_code']}")
+        if isinstance(t.get("duration"), (int, float)):
+            meta.append(f"{t['duration']:.0f}s")
+        suffix = f" · {' · '.join(meta)}" if meta else ""
+        lines.append(f"{icon} `{command}`{suffix}")
+    body = "\n".join(lines) or "…"
+    return {
+        "tag": "collapsible_panel",
+        "expanded": bool(running),
+        "header": {
+            "title": {"tag": "plain_text", "content": title},
+            "vertical_align": "center",
+            "icon": {
+                "tag": "standard_icon",
+                "token": "down-small-ccm_outlined",
+                "color": "",
+                "size": "16px 16px",
+            },
+            "icon_position": "right",
+            "icon_expanded_angle": -180,
+        },
+        "border": {"color": "grey", "corner_radius": "5px"},
+        "vertical_spacing": "8px",
+        "padding": "8px 8px 8px 8px",
+        "elements": [{"tag": "markdown", "content": body}],
+    }
+
+
+def _build_background_tasks_card(tasks: list[dict[str, Any]]) -> dict[str, Any]:
+    """Standalone background-task card, used when the chat has no progress card to fold into."""
+    return {
+        "schema": "2.0",
+        "config": {"width_mode": "fill"},
+        "body": {"elements": [_bg_panel_element(tasks)]},
+    }
+
+
 def _card_button(label: str, btn_type: str, value: dict[str, Any]) -> dict[str, Any]:
     return {"tag": "button", "text": {"tag": "plain_text", "content": label}, "type": btn_type, "value": value}
 
 
 def _card(title: str, template: str, markdown: str, *, actions: Optional[list[dict[str, Any]]] = None) -> dict[str, Any]:
-    """Wide interactive card: colored header + one markdown block (+ an optional button row)."""
+    """Wide interactive card: colored header + one markdown block (+ an optional button row).
+
+    Schema 1.0 shape (top-level header/elements), so width stays on ``wide_screen_mode``;
+    ``width_mode`` is the 2.0 spelling and is ignored here.
+    """
     elements: list[dict[str, Any]] = [{"tag": "markdown", "content": markdown}]
     if actions is not None:
         elements.append({"tag": "action", "actions": actions})
@@ -1296,6 +1591,12 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
     supports_code_blocks = True  # Feishu renders fenced code blocks
     splits_long_messages = True  # send() chunks via truncate_message(MAX_MESSAGE_LENGTH)
     serial_receive_loop = True  # a chat's next message waits on its lock (_handle_message_with_guards)
+    # Tool progress renders as a collapsed interactive card; the panel hides the length,
+    # so the gateway may keep whole commands instead of truncating to one short line.
+    folded_progress_full_command = True
+    # One card per turn: a text bubble landing below must not split the progress card.
+    progress_card_survives_reset = True
+
     MAX_MESSAGE_LENGTH = 8000
     CHAT_LOCK_MAX_SIZE: int = 1000  # distinct chat IDs kept in _chat_locks before LRU eviction
     _SPLIT_THRESHOLD = 4000  # chunk near Feishu's ~4096-char client split → continuation almost certain
@@ -1351,6 +1652,64 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         self._init_choice_card_state()
         # Reaction deletion needs the opaque reaction_id from create, cached per message_id.
         self._pending_processing_reactions: OrderedDict[str, str] = OrderedDict()
+        # Folded tool-progress cards: message_id → update counter, so edits stay in the same card.
+        self._progress_card_counts: OrderedDict[str, int] = OrderedDict()
+        self._PROGRESS_CARD_MAX = 50
+        # chat_id → the live progress card for the current turn, plus its last rendered body,
+        # so the final reply can be folded into the same message instead of a second one.
+        self._progress_card_by_chat: dict[str, str] = {}
+        self._progress_card_bodies: dict[str, str] = {}
+        # Feishu-only: one collapsible background-task card per chat (create-or-patch), so a
+        # finished background job updates that panel instead of sending its own chat message.
+        self._bg_task_card_by_chat: dict[str, str] = {}
+        self._bg_task_card_tasks: dict[str, list[dict[str, Any]]] = OrderedDict()
+        # Last finished turn's card per chat: a later background-task update patches that same
+        # bubble (tools → jobs → reply) instead of appending a new message below the reply.
+        self._final_card_by_chat: dict[str, str] = {}
+        self._final_card_text: dict[str, str] = {}
+        # Job ids already shown in a previous turn: a new turn's panel starts empty instead of
+        # re-listing every finished job of the conversation.
+        self._bg_seen_ids: dict[str, set[str]] = {}
+        # Heartbeat: keep the progress card ticking so a long think/tool run never looks dead.
+        self._heartbeat_tasks: dict[str, Any] = {}
+        self._last_progress_at: dict[str, float] = {}
+        # What the agent is doing right now: thinking / tool / waiting. Written by gateway
+        # callbacks, read by the heartbeat to age the label and flag a stalled turn.
+        self._agent_status: dict[str, dict[str, Any]] = {}
+        # Sub-agents get their own rows under the main status, not the status line itself.
+        self._subagents: dict[str, dict[int, dict[str, Any]]] = {}
+        self._subagent_seq: dict[str, int] = {}
+        # Per-line first-seen stamps, so finished tools can show their elapsed time.
+        self._line_first_seen: dict[str, dict[str, float]] = {}
+        # Status-refresh throttle: tool events already patch the card, so a state change within
+        # the same second doesn't need a second round-trip.
+        self._status_refresh_at: dict[str, float] = {}
+        # When the last answer landed, so a quick follow-up can be merged into that same card.
+        self._final_card_at: dict[str, float] = {}
+        # Whether the current turn came from an internal notice (not a user message): notice
+        # turns fold into the card the user's turn opened instead of starting a new bubble.
+        self._turn_internal: dict[str, bool] = {}
+        # CardKit entity behind the chat's turn card. Element patches address the entity id,
+        # not the message id, and every operation must carry a strictly increasing sequence.
+        self._card_id_by_chat = _CARD_IDS
+        self._card_seq = _CARD_SEQ
+        # Start/end of the turn currently owning this chat's card, for the footer duration.
+        self._turn_started_at: dict[str, float] = {}
+        self._turn_ended_at: dict[str, float] = {}
+        # Turn (by its start stamp) that the card's stop button ended, so the finished card can
+        # say "已停止" and a second click on a stale card is refused instead of stopping a new turn.
+        self._stopped_turns: dict[str, float] = {}
+        # Who opened the current turn, for feishu.stop_button_scope=starter ("" when unknown).
+        self._turn_owner: dict[str, str] = {}
+        # Last time the card content actually changed: the heartbeat is a 10s fallback only.
+        self._last_card_update_at: dict[str, float] = {}
+        # Serializes "allocate sequence -> PATCH -> await response" for this card.
+        # The module-level _CARD_LOCK only guarantees unique numbers, NOT arrival order: two
+        # in-flight patches can reach Feishu out of order, and the older one is rejected with
+        # "sequence number compare failed". Holding this lock across the request keeps
+        # allocation order == delivery order.
+        self._card_patch_lock: Any = None
+        self._loop: Any = None
         self._load_seen_message_ids()
 
     @staticmethod
@@ -1391,6 +1750,16 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             )
             allow_bots = "none"
 
+        # Who may press the turn card's stop button. Unknown values fall back to the widest
+        # setting so a typo never silently removes a control the user asked for.
+        stop_scope = str(_extra_or_secret("stop_button_scope", "FEISHU_STOP_BUTTON_SCOPE", "all") or "all").strip().lower()
+        if stop_scope not in {"all", "starter_admin", "starter"}:
+            logger.warning(
+                "[Feishu] Unknown stop_button_scope=%r, falling back to 'all'. Valid: all, starter_admin, starter.",
+                stop_scope,
+            )
+            stop_scope = "all"
+
         allow_all_dm = any(
             _secret(var).lower() in {"true", "1", "yes"} for var in ("FEISHU_ALLOW_ALL_USERS", "GATEWAY_ALLOW_ALL_USERS")
         )
@@ -1422,6 +1791,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             admins=frozenset(_id_set(extra.get("admins", []))),
             default_group_policy=str(extra.get("default_group_policy", "")).strip().lower(),
             group_rules=group_rules, allow_bots=allow_bots, allow_all_dm=allow_all_dm,
+            stop_button_scope=stop_scope,
             require_mention=_to_boolean(extra.get("require_mention", _get_scoped_secret("FEISHU_REQUIRE_MENTION", "true"))),
         )
 
@@ -1672,6 +2042,54 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         # See #26841.
         prefer_post = bool(_MARKDOWN_HINT_RE.search(formatted))
 
+        # Tool-progress lane: one collapsed card per bubble, later edits replace it in place.
+        if _is_progress_card_request(metadata):
+            if self._turn_internal.get(chat_id):
+                # Notice-driven turn: the card on screen belongs to the user's turn — don't
+                # open another one just to report progress.
+                return SendResult(success=True)
+            # The turn card may already exist (opened when the message arrived): patch that
+            # bubble instead of stacking a second one on top of it.
+            _existing_card = self._progress_card_by_chat.get(chat_id)
+            if _existing_card:
+                _edited = await self.edit_message(chat_id, _existing_card, content, metadata=metadata)
+                if _edited.success:
+                    return _edited
+            try:
+                card_payload = json.dumps(
+                    _build_progress_card(
+                        self._decorate_progress_body(chat_id, formatted), count=_progress_tool_count(metadata),
+                        reply_open_id=_progress_reply_open_id(metadata),
+                        bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                        subagents=self._subagent_lines(chat_id),
+                        elapsed_s=self._turn_elapsed(chat_id),
+                        status_label=self._status_label(chat_id),
+                        stop_value=self._stop_payload(chat_id),
+                    ), ensure_ascii=False,
+                )
+                response = await self._feishu_send_with_retry(
+                    chat_id=chat_id,
+                    msg_type="interactive",
+                    payload=card_payload,
+                    reply_to=reply_to,
+                    metadata=metadata,
+                )
+                result = self._finalize_send_result(response, "send progress card failed")
+                if result.success:
+                    if result.message_id:
+                        self._remember_progress_card(result.message_id)
+                        self._progress_card_by_chat[chat_id] = result.message_id
+                        self._progress_card_bodies[result.message_id] = formatted
+                        self._last_progress_at[chat_id] = time.time()
+                        self._start_progress_heartbeat(chat_id, result.message_id)
+                    return result
+                logger.warning(
+                    "[Feishu] Progress card rejected (%s); falling back to post/text",
+                    getattr(response, "msg", "") or result.error,
+                )
+            except Exception as exc:
+                logger.warning("[Feishu] Progress card send failed: %s; falling back to post/text", exc)
+
         async def _send_plain(chunk: str) -> Any:
             return await self._feishu_send_with_retry(
                 chat_id=chat_id,
@@ -1707,18 +2125,739 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             logger.error("[Feishu] Send error: %s", (shown := describe_proxy_error(exc, env_proxy_for_redaction(_onboard_open_base_url(self._domain_name)))) or exc, exc_info=not shown)
             return SendResult(success=False, error=shown or str(exc))
 
-    async def edit_message(self, chat_id: str, message_id: str, content: str, *, finalize: bool = False) -> SendResult:
-        """Edit a previously sent Feishu text/post message."""
+    def _remember_progress_card(self, message_id: str) -> None:
+        """Track a progress-card message so later edits reuse the card instead of text/post."""
+        counts = self._progress_card_counts
+        counts[message_id] = 1
+        counts.move_to_end(message_id)
+        while len(counts) > self._PROGRESS_CARD_MAX:
+            counts.popitem(last=False)
+
+    async def append_final_to_progress_card(
+        self, chat_id: str, text: str, metadata: Optional[dict[str, Any]] = None,
+    ) -> bool:
+        """Fold the turn's final answer into the live progress card.
+
+        Returns True when the answer was delivered inside the card, so the caller skips a
+        separate final message and the whole turn stays one bubble. False (no live card,
+        oversized payload, or API failure) leaves the caller to send normally.
+        """
+        if not text or not self._client:
+            return False
+        message_id = self._progress_card_by_chat.get(chat_id)
+        if not message_id:
+            # No live card. A burst of notification-driven turns should read as one reply, so fold
+            # into the answer that just landed instead of opening yet another bubble.
+            _prev_id = self._final_card_by_chat.get(chat_id)
+            # Only notice-driven turns fold in: a fresh user message is a new turn and a new card.
+            if not _prev_id or not self._turn_internal.get(chat_id):
+                return False
+            _prev_text = (self._final_card_text.get(_prev_id) or "").strip()
+            _merged = f"{_prev_text}\n\n{text}".strip() if _prev_text else text
+            # Keep the original tool rows: an empty body would hide the collapsible panel.
+            _prev_body = self._progress_card_bodies.get(_prev_id, "")
+            _card = _build_progress_card(
+                _prev_body, count=self._progress_card_counts.get(_prev_id, 0), final_text=_merged,
+                reply_open_id=_progress_reply_open_id(metadata),
+                bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                subagents=self._subagent_lines(chat_id),
+                elapsed_s=self._turn_elapsed(chat_id),
+                finished_at=self._turn_ended_at.get(chat_id),
+                stopped=self._turn_stopped(chat_id),
+            )
+            _payload = json.dumps(_card, ensure_ascii=False)
+            if len(_payload.encode("utf-8")) > 28000:
+                return False
+            try:
+                # CardKit entity first: one sequence-guarded update, no message rewrite.
+                if await self._cardkit_update_card(chat_id, _card):
+                    self._final_card_text[_prev_id] = _merged
+                    self._final_card_at[chat_id] = time.time()
+                    return True
+                _body = self._build_update_message_body(msg_type=None, content=_payload)
+                _req = self._build_update_message_request(message_id=_prev_id, request_body=_body)
+                _patch = getattr(HttpMethod, "PATCH", None)
+                if _patch is not None:
+                    _req.http_method = _patch
+                _resp = await self._run_blocking(self._client.im.v1.message.update, _req)
+                _ok = bool(self._finalize_send_result(_resp, "final merge failed").success)
+                if _ok:
+                    self._final_card_text[_prev_id] = _merged
+                    self._final_card_at[chat_id] = time.time()
+                return _ok
+            except Exception as exc:
+                logger.warning("[Feishu] Merging the answer into the previous card failed: %s", exc)
+                return False
+        body = self._progress_card_bodies.get(message_id, "")
+        card = _build_progress_card(
+            self._decorate_progress_body(chat_id, body), count=self._progress_card_counts.get(message_id, 0), final_text=text,
+            reply_open_id=_progress_reply_open_id(metadata),
+            bg_tasks=self._bg_task_card_tasks.get(chat_id),
+            subagents=self._subagent_lines(chat_id),
+            elapsed_s=self._turn_elapsed(chat_id),
+            finished_at=self._turn_ended_at.get(chat_id),
+            stopped=self._turn_stopped(chat_id),
+        )
+        payload = json.dumps(card, ensure_ascii=False)
+        # Feishu caps a card update at 30 KB; fall back to a normal send past that.
+        if len(payload.encode("utf-8")) > 28000:
+            logger.info("[Feishu] final answer too large to fold into the progress card")
+            return False
+        try:
+            # CardKit entity first; the message-level PATCH stays as the fallback.
+            if await self._cardkit_update_card(chat_id, card):
+                self._final_card_text[message_id] = text
+                return True
+            request_body = self._build_update_message_body(msg_type=None, content=payload)
+            request = self._build_update_message_request(message_id=message_id, request_body=request_body)
+            patch = getattr(HttpMethod, "PATCH", None)
+            if patch is not None:
+                request.http_method = patch
+            response = await self._run_blocking(self._client.im.v1.message.update, request)
+            ok = bool(self._finalize_send_result(response, "final append failed").success)
+            if ok:
+                # Remember the answer so a later background-task patch rebuilds the same
+                # tools → jobs → reply card instead of emitting a new bubble.
+                self._final_card_text[message_id] = text
+            return ok
+        except Exception as exc:
+            logger.warning("[Feishu] Folding the final answer into the progress card failed: %s", exc)
+            return False
+        finally:
+            # One turn per card: the next turn starts a fresh one.
+            self.clear_progress_card(chat_id)
+
+    async def abandon_progress_card(self, chat_id: str, note: str = "") -> None:
+        """Close a live turn card that will never receive an answer.
+
+        A turn can end without any final message: a newer run superseded this one, the gateway
+        drained for a restart, or the agent raised before producing text. Left alone the card
+        keeps its last ``思考中 / 工具调用中`` strip forever and the chat reads as stuck — and the
+        next turn reuses that same bubble. Patch a terminal strip plus a short note, then retire
+        the card exactly like a finished turn.
+        """
+        message_id = self._progress_card_by_chat.get(chat_id)
+        if not message_id:
+            return
+        text = note or "⚠️ 本轮没有产出结果（被重启或新消息打断），请重发一次。"
+        self._turn_ended_at.setdefault(chat_id, time.time())
+        try:
+            card = _build_progress_card(
+                self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
+                count=self._progress_card_counts.get(message_id, 0),
+                final_text=text,
+                bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                subagents=self._subagent_lines(chat_id),
+                elapsed_s=self._turn_elapsed(chat_id),
+                finished_at=self._turn_ended_at.get(chat_id),
+                stopped=self._turn_stopped(chat_id),
+            )
+            if await self._cardkit_update_card(chat_id, card):
+                self._final_card_text[message_id] = text
+            else:
+                # A CardKit outage must not leave the spinner behind: fall back to the message PATCH.
+                _payload = json.dumps(card, ensure_ascii=False)
+                _body = self._build_update_message_body(msg_type=None, content=_payload)
+                _req = self._build_update_message_request(message_id=message_id, request_body=_body)
+                _patch = getattr(HttpMethod, "PATCH", None)
+                if _patch is not None:
+                    _req.http_method = _patch
+                _resp = await self._run_blocking(self._client.im.v1.message.update, _req)
+                if self._finalize_send_result(_resp, "abandoned card patch failed").success:
+                    self._final_card_text[message_id] = text
+        except Exception:
+            logger.debug("[Feishu] closing an abandoned turn card failed", exc_info=True)
+        finally:
+            self.clear_progress_card(chat_id)
+
+    def _get_card_patch_lock(self):
+        """The shared patch lock: allocation order must equal delivery order."""
+        return _CARD_PATCH_LOCK
+
+    def _start_progress_heartbeat(self, chat_id: str, message_id: str) -> None:
+        """Tick the progress card every 10s so a long think or tool run never looks stuck."""
+        task = self._heartbeat_tasks.get(chat_id)
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._heartbeat_tasks[chat_id] = loop.create_task(
+            self._progress_heartbeat_loop(chat_id, message_id)
+        )
+
+    def _stop_progress_heartbeat(self, chat_id: str) -> None:
+        task = self._heartbeat_tasks.pop(chat_id, None)
+        self._last_progress_at.pop(chat_id, None)
+        if task is not None and not task.done():
+            task.cancel()
+
+    def note_agent_status(self, chat_id: str, state: str, detail: Optional[str] = None) -> None:
+        """Record what the agent is doing and stamp activity (called from gateway callbacks).
+
+        state: ``thinking`` (model generating), ``tool`` (waiting on a tool), ``subagent``
+        (delegation running), ``waiting`` (blocked on the user, so the heartbeat must not tick).
+        A change of state patches the card right away — the timer is only the stall fallback.
+        """
+        now = time.time()
+        prev = self._agent_status.get(chat_id) or {}
+        self._agent_status[chat_id] = {"state": state, "detail": detail, "since": now}
+        self._last_progress_at[chat_id] = now
+        if (prev.get("state"), prev.get("detail")) != (state, detail):
+            self._schedule_status_refresh(chat_id)
+
+    def _schedule_status_refresh(self, chat_id: str) -> None:
+        """Patch the status strip from a callback thread (agent thread has no running loop)."""
+        loop = getattr(self, "_loop", None)
+        if loop is None or loop.is_closed():
+            return
+        now = time.time()
+        # Tool progress patches the same card a moment later, so skip the duplicate within 1s;
+        # a dropped refresh is superseded by that patch or the next state change.
+        if now - self._status_refresh_at.get(chat_id, 0) < 1.0:
+            return
+        self._status_refresh_at[chat_id] = now
+        try:
+            asyncio.run_coroutine_threadsafe(self._refresh_status_card(chat_id), loop)
+        except Exception:
+            logger.debug("[Feishu] status refresh schedule failed", exc_info=True)
+
+    async def _refresh_status_card(self, chat_id: str) -> None:
+        message_id = self._progress_card_by_chat.get(chat_id)
+        if not message_id or not self._client:
+            return
+        _label = self._status_label(chat_id)
+        try:
+            # Element-level first: a state change usually touches only the status strip.
+            if await self._cardkit_patch_element(chat_id, "status", {"content": _label}):
+                if self._subagents.get(chat_id):
+                    await self._cardkit_patch_element(
+                        chat_id, "subagents", {"content": "\n".join(self._subagent_lines(chat_id))},
+                    )
+                self._last_progress_at[chat_id] = time.time()
+                return
+        except Exception:
+            logger.debug("[Feishu] status element patch failed", exc_info=True)
+        card = _build_progress_card(
+            self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
+            count=self._progress_card_counts.get(message_id, 0),
+            final_text=self._final_card_text.get(message_id),
+            bg_tasks=self._bg_task_card_tasks.get(chat_id),
+            subagents=self._subagent_lines(chat_id),
+            elapsed_s=self._turn_elapsed(chat_id),
+            finished_at=self._turn_ended_at.get(chat_id),
+            stopped=self._turn_stopped(chat_id),
+            status_label=self._status_label(chat_id),
+        )
+        payload = json.dumps(card, ensure_ascii=False)
+        if len(payload.encode("utf-8")) > 28000:
+            return
+        try:
+            request_body = self._build_update_message_body(msg_type=None, content=payload)
+            request = self._build_update_message_request(message_id=message_id, request_body=request_body)
+            patch = getattr(HttpMethod, "PATCH", None)
+            if patch is not None:
+                request.http_method = patch
+            response = await self._run_blocking(self._client.im.v1.message.update, request)
+            if self._finalize_send_result(response, "status refresh failed").success:
+                self._last_progress_at[chat_id] = time.time()
+        except Exception:
+            logger.debug("[Feishu] status refresh failed", exc_info=True)
+
+    def note_subagent_start(self, chat_id: str, name: str = "") -> int:
+        """Allocate the next sub-agent row; sub-agents never replace the main status line."""
+        seq = self._subagent_seq.get(chat_id, 0) + 1
+        self._subagent_seq[chat_id] = seq
+        rows = self._subagents.setdefault(chat_id, {})
+        rows[seq] = {"name": name, "state": "运行中", "since": time.time()}
+        self._last_progress_at[chat_id] = time.time()
+        self._schedule_status_refresh(chat_id)
+        return seq
+
+    def note_subagent_done(self, chat_id: str, seq: int, state: str = "完成") -> None:
+        rows = self._subagents.get(chat_id)
+        if rows and seq in rows:
+            rows[seq]["state"] = state
+            self._last_progress_at[chat_id] = time.time()
+            self._schedule_status_refresh(chat_id)
+
+    def note_all_subagents_done(self, chat_id: str, state: str = "完成") -> None:
+        """Mark every unfinished sub-agent row; one delegation unit can hold several tasks."""
+        rows = self._subagents.get(chat_id)
+        if not rows:
+            return
+        changed = False
+        for row in rows.values():
+            if row.get("state") != state:
+                row["state"] = state
+                changed = True
+        if changed:
+            self._schedule_status_refresh(chat_id)
+
+    def note_subagent_done_last(self, chat_id: str, state: str = "完成") -> None:
+        """Flip the newest sub-agent row (the gateway's tool-complete has no sequence number)."""
+        rows = self._subagents.get(chat_id) or {}
+        if rows:
+            self.note_subagent_done(chat_id, max(rows), state)
+
+    def _subagent_lines(self, chat_id: str) -> list[str]:
+        rows = self._subagents.get(chat_id) or {}
+        now = time.time()
+        out = []
+        for seq in sorted(rows):
+            row = rows[seq]
+            state = row.get("state", "")
+            # Running rows tick like the main status; a finished one shows the state only.
+            suffix = f" · {int(now - row.get('since', now))}s" if state in {"运行中", "后台运行中"} else ""
+            out.append(f"🤖 sub agent {seq}: {state}{suffix}")
+        return out
+
+    def _decorate_progress_body(self, chat_id: str, content: str) -> str:
+        """Append each finished tool's elapsed time, so rows match the status strip's style.
+
+        A row counts as finished once a newer row appears, or when the agent has moved on to
+        thinking/waiting; the row still running is left bare.
+        """
+        if not content:
+            return content
+        lines = content.rstrip("\n").split("\n")
+        if not lines:
+            return content
+        now = time.time()
+        seen = self._line_first_seen.setdefault(chat_id, {})
+        state = (self._agent_status.get(chat_id) or {}).get("state")
+        running = -1 if state in {"thinking", "waiting"} else len(lines) - 1
+        out: list[str] = []
+        for i, line in enumerate(lines):
+            key = line.strip()[:100]
+            if key:
+                seen.setdefault(key, now)
+            if i != running and key and _TOOL_ROW_RE.match(line) and not re.search(r"·\s*\d+s$", line):
+                dur = int(now - seen.get(key, now))
+                if dur >= 1:
+                    line = f"{line.rstrip()} · {dur}s"
+            out.append(line)
+        return "\n".join(out)
+
+    def _turn_elapsed(self, chat_id: str) -> Optional[float]:
+        """Seconds this turn ran (frozen once the answer landed), else None."""
+        started = self._turn_started_at.get(chat_id)
+        if not started:
+            return None
+        # A finished turn keeps its final duration: a late background-task patch must not
+        # report the wall-clock time since the turn ended.
+        return self._turn_ended_at.get(chat_id, time.time()) - started
+
+    def _status_label(self, chat_id: str, *, idle: float = 0.0) -> str:
+        st = self._agent_status.get(chat_id) or {}
+        state = st.get("state") or "thinking"
+        detail = st.get("detail")
+        elapsed = int(time.time() - (st.get("since") or time.time()))
+        if state == "waiting":
+            return "⏳ 等你确认"
+        if state == "subagent":
+            head = f"🤖 子代理中 · {detail}" if detail else "🤖 子代理中"
+            return f"{head} · {elapsed}s"
+        if state == "tool":
+            head = f"🔧 工具调用中 · {detail}" if detail else "🔧 工具调用中"
+            return f"{head} · {elapsed}s"
+        if state in {"redirect", "steer"}:
+            head = "↪ 已收到补充，按新指令调整" if state == "redirect" else "⏩ 已插话，下次工具调用后生效"
+            return f"{head} · {elapsed}s"
+        if idle >= 180:
+            return f"⚠️ 可能卡住 · {int(idle // 60)} 分钟无响应"
+        if idle >= 60:
+            return f"🧠 思考中 · 距上次活动 {int(idle)}s"
+        return f"🧠 思考中 · {elapsed}s"
+
+    async def _cardkit_create_card(self, card: dict[str, Any]) -> Optional[str]:
+        """Create a CardKit entity so later updates can patch a single element."""
+        if not self._client:
+            return None
+        try:
+            from lark_oapi.api.cardkit.v1 import CreateCardRequest, CreateCardRequestBody
+            body = (
+                CreateCardRequestBody.builder()
+                .type("card_json")
+                .data(json.dumps(card, ensure_ascii=False))
+                .build()
+            )
+            request = CreateCardRequest.builder().request_body(body).build()
+            response = await self._run_blocking(self._client.cardkit.v1.card.create, request)
+            if not getattr(response, "success", lambda: False)():
+                logger.info("[Feishu] cardkit create failed: %s", getattr(response, "msg", ""))
+                return None
+            data = getattr(response, "data", None)
+            return str(getattr(data, "card_id", "") or "") or None
+        except Exception:
+            logger.debug("[Feishu] cardkit create error", exc_info=True)
+            return None
+
+    async def _cardkit_patch_element(
+        self, chat_id: str, element_id: str, partial: dict[str, Any],
+    ) -> bool:
+        """Patch one element of the chat's turn card — the cheap path for the status strip."""
+        card_id = self._card_id_by_chat.get(chat_id)
+        if not card_id or not self._client:
+            return False
+        from lark_oapi.api.cardkit.v1 import PatchCardElementRequest, PatchCardElementRequestBody
+        # Two attempts: when two updates race, the later sequence can land first and the
+        # earlier one gets rejected — retrying with a fresh, larger sequence settles it.
+        for _attempt in range(2):
+            with _CARD_LOCK:
+                seq = self._card_seq.get(chat_id, 0) + 1
+                self._card_seq[chat_id] = seq
+            try:
+                body = (
+                    PatchCardElementRequestBody.builder()
+                    .partial_element(json.dumps(partial, ensure_ascii=False))
+                    .sequence(seq)
+                    .build()
+                )
+                request = (
+                    PatchCardElementRequest.builder()
+                    .card_id(card_id)
+                    .element_id(element_id)
+                    .request_body(body)
+                    .build()
+                )
+                async with _CARD_PATCH_LOCK:
+                    response = await self._run_blocking(self._client.cardkit.v1.card_element.patch, request)
+                if getattr(response, "success", lambda: False)():
+                    self._last_card_update_at[chat_id] = time.time()
+                    return True
+                msg = str(getattr(response, "msg", ""))
+                logger.info("[Feishu] cardkit patch %s failed: %s", element_id, msg)
+                if "sequence" not in msg:
+                    return False
+            except Exception:
+                logger.debug("[Feishu] cardkit patch error", exc_info=True)
+                return False
+        return False
+
+
+    async def _cardkit_update_card(self, chat_id: str, card: dict[str, Any]) -> bool:
+        """Replace the whole card entity (the layout is dynamic: panels come and go)."""
+        card_id = self._card_id_by_chat.get(chat_id)
+        if not card_id or not self._client:
+            return False
+        from lark_oapi.api.cardkit.v1 import Card, UpdateCardRequest, UpdateCardRequestBody
+        for _attempt in range(2):
+            with _CARD_LOCK:
+                seq = self._card_seq.get(chat_id, 0) + 1
+                self._card_seq[chat_id] = seq
+            try:
+                body = (
+                    UpdateCardRequestBody.builder()
+                    .card(
+                        Card.builder()
+                        .type("card_json")
+                        .data(json.dumps(card, ensure_ascii=False))
+                        .build()
+                    )
+                    .sequence(seq)
+                    .build()
+                )
+                request = UpdateCardRequest.builder().card_id(card_id).request_body(body).build()
+                async with _CARD_PATCH_LOCK:
+                    response = await self._run_blocking(self._client.cardkit.v1.card.update, request)
+                if getattr(response, "success", lambda: False)():
+                    self._last_card_update_at[chat_id] = time.time()
+                    return True
+                msg = str(getattr(response, "msg", ""))
+                logger.info("[Feishu] cardkit update failed: %s", msg)
+                if "sequence" not in msg:
+                    return False
+            except Exception:
+                logger.debug("[Feishu] cardkit update error", exc_info=True)
+                return False
+        return False
+
+
+    async def begin_turn_card(self, chat_id: str, reply_to: Optional[str] = None,
+                              metadata: Optional[dict[str, Any]] = None,
+                              internal: bool = False) -> Optional[str]:
+        """Open the turn's progress card as soon as the message is accepted, so the chat sees
+        activity before (and even without) any tool call."""
+        self._turn_internal[chat_id] = bool(internal)
+        # A notice-driven turn inherits the running clock of the user's turn.
+        if not internal or chat_id not in self._turn_started_at:
+            self._turn_started_at[chat_id] = time.time()
+            self._turn_ended_at.pop(chat_id, None)
+            # A fresh turn is not "stopped": clear the label an earlier turn left behind, and
+            # remember who opened it for feishu.stop_button_scope=starter.
+            self._stopped_turns.pop(chat_id, None)
+            self._turn_owner[chat_id] = _progress_reply_open_id(metadata) or ""
+        try:
+            # Remember the gateway loop first: status refreshes from callback threads need it even
+            # when this turn reuses an existing bubble.
+            self._loop = asyncio.get_running_loop()
+        except RuntimeError:
+            pass
+        if not self._client:
+            return None
+        if internal and self._final_card_by_chat.get(chat_id):
+            # A notice-driven turn: the bubble on screen is the user's, so answer inside it.
+            return None
+        existing = self._progress_card_by_chat.get(chat_id)
+        if existing and self._final_card_by_chat.get(chat_id) == existing:
+            # A retired card left behind by an abnormal end: this is a new turn, so open a fresh one.
+            self._progress_card_by_chat.pop(chat_id, None)
+            self._progress_card_bodies.pop(existing, None)
+            existing = None
+        if existing:
+            return None
+        # A new turn starts with no jobs of its own: drop the previous turn's list so the
+        # panel never opens showing stale background tasks.
+        self._bg_task_card_tasks.pop(chat_id, None)
+        # Fresh sub-agent numbering for this turn.
+        self._subagents.pop(chat_id, None)
+        self._subagent_seq[chat_id] = 0
+        self._line_first_seen.pop(chat_id, None)
+        self.note_agent_status(chat_id, "thinking")
+        card = _build_progress_card(
+            "", count=0, reply_open_id=_progress_reply_open_id(metadata),
+            status_label=self._status_label(chat_id),
+            elapsed_s=self._turn_elapsed(chat_id),
+            stop_value=self._stop_payload(chat_id),
+        )
+        payload = json.dumps(card, ensure_ascii=False)
+        try:
+            # Prefer a CardKit entity: posting a reference to it lets later updates patch a
+            # single element instead of resending the whole card. Fall back to a plain card.
+            _card_id = await self._cardkit_create_card(card)
+            if _card_id:
+                payload = json.dumps({"type": "card", "data": {"card_id": _card_id}}, ensure_ascii=False)
+            response = await self._feishu_send_with_retry(
+                chat_id=chat_id, msg_type="interactive", payload=payload,
+                reply_to=reply_to, metadata=metadata,
+            )
+            result = self._finalize_send_result(response, "turn card send failed")
+            if not (result.success and result.message_id):
+                return None
+            if _card_id:
+                self._card_id_by_chat[chat_id] = _card_id
+                self._card_seq[chat_id] = 0
+            else:
+                # No entity this turn: drop the stale id so updates can't land on last turn's card.
+                self._card_id_by_chat.pop(chat_id, None)
+            self._remember_progress_card(result.message_id)
+            self._progress_card_by_chat[chat_id] = result.message_id
+            self._progress_card_bodies[result.message_id] = ""
+            self._start_progress_heartbeat(chat_id, result.message_id)
+            return result.message_id
+        except Exception:
+            logger.debug("[Feishu] begin turn card failed", exc_info=True)
+            return None
+
+    async def _progress_heartbeat_loop(self, chat_id: str, message_id: str) -> None:
+        """Idle-only heartbeat: stays silent while callbacks keep the card fresh, then re-renders
+        it with the activity age — amber past 60s, red past 3 minutes."""
+        started = time.time()
+        fails = 0
+        try:
+            while True:
+                await asyncio.sleep(2)
+                if self._progress_card_by_chat.get(chat_id) != message_id:
+                    return
+                if (self._agent_status.get(chat_id) or {}).get("state") == "waiting":
+                    # Blocked on the user: not a stall, and no ticking.
+                    continue
+                # Fallback only: every content update already carries the elapsed time, so
+                # refresh just when nothing has touched the card for 10 seconds.
+                if time.time() - self._last_card_update_at.get(chat_id, started) < 10:
+                    continue
+                idle = time.time() - self._last_progress_at.get(chat_id, started)
+                # One full update per idle window: the card regenerates status + footer together,
+                # which avoids depending on element ids surviving a PUT.
+                _label = self._status_label(chat_id, idle=idle)
+                card = _build_progress_card(
+                    self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
+                    count=self._progress_card_counts.get(message_id, 0),
+                    status_label=_label,
+                    bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                    subagents=self._subagent_lines(chat_id),
+                    elapsed_s=self._turn_elapsed(chat_id),
+                    stop_value=self._stop_payload(chat_id),
+                )
+                payload = json.dumps(card, ensure_ascii=False)
+                if len(payload.encode("utf-8")) > 28000:
+                    return
+                request_body = self._build_update_message_body(msg_type=None, content=payload)
+                request = self._build_update_message_request(message_id=message_id, request_body=request_body)
+                patch = getattr(HttpMethod, "PATCH", None)
+                if patch is not None:
+                    request.http_method = patch
+                async with self._get_card_patch_lock():
+                    response = await self._run_blocking(self._client.im.v1.message.update, request)
+                if not self._finalize_send_result(response, "heartbeat update failed").success:
+                    # A single failed patch must NOT kill the heartbeat. The common case is
+                    # CardKit "sequence number compare failed": a content/status patch that was
+                    # allocated a higher sequence overtook us in flight, so the server already
+                    # applied a newer revision. That is a lost race, not a dead card — stamp the
+                    # update time (so we don't retry every 2s), back off, and keep the loop alive.
+                    self._last_card_update_at[chat_id] = time.time()
+                    fails += 1
+                    if fails > 12:
+                        logger.info(
+                            "[Feishu] heartbeat giving up after %d consecutive failures (chat=%s)",
+                            fails, chat_id,
+                        )
+                        return
+                    await asyncio.sleep(min(2 ** min(fails, 4), 20))
+                    continue
+                fails = 0
+                self._last_progress_at[chat_id] = time.time()
+                self._last_card_update_at[chat_id] = time.time()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("[Feishu] progress heartbeat stopped", exc_info=True)
+
+    def clear_progress_card(self, chat_id: str) -> None:
+        """Retire the chat's live progress card but keep it as the turn's final bubble.
+
+        Background-task updates later patch this same card, so the order stays
+        tools → background jobs → reply instead of appending a new message below the answer.
+        """
+        self._stop_progress_heartbeat(chat_id)
+        message_id = self._progress_card_by_chat.pop(chat_id, None)
+        if not message_id:
+            return
+        # Jobs shown in this turn stay hidden in the next turn's panel. Keep the set bounded:
+        # there is no value in remembering every job id for the life of the chat.
+        _seen = set(self._bg_seen_ids.get(chat_id, set()))
+        _seen.update(t.get("id", "") for t in self._bg_task_card_tasks.get(chat_id, []) if t.get("id"))
+        self._bg_seen_ids[chat_id] = set(sorted(_seen)[-50:])
+        old = self._final_card_by_chat.get(chat_id)
+        if old and old != message_id:
+            self._progress_card_bodies.pop(old, None)
+            self._progress_card_counts.pop(old, None)
+            self._final_card_text.pop(old, None)
+        self._final_card_by_chat[chat_id] = message_id
+        self._final_card_at[chat_id] = time.time()
+        self._turn_ended_at[chat_id] = time.time()
+
+    async def update_background_tasks_card(self, chat_id: str, tasks: list[dict[str, Any]]) -> SendResult:
+        """Fold background-task status into the chat's turn card, between tools and the reply.
+
+        Patches the live progress card, else the last finished turn's card, so the panel always
+        lands between the tool list and the answer. Creates a standalone card only when the chat
+        has no turn card at all.
+        """
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        # Only this turn's jobs: anything already shown in an earlier turn stays hidden
+        # unless it is still running.
+        seen = self._bg_seen_ids.get(chat_id, set())
+        tasks = [t for t in tasks if t.get("status") == "running" or t.get("id") not in seen]
+        self._bg_task_card_tasks[chat_id] = list(tasks)
+        if not tasks and not (self._progress_card_by_chat.get(chat_id) or self._final_card_by_chat.get(chat_id)):
+            return SendResult(success=True)
+        try:
+            folded_id = self._progress_card_by_chat.get(chat_id) or self._final_card_by_chat.get(chat_id)
+            if folded_id and (folded_id in self._progress_card_bodies or folded_id in self._final_card_text):
+                card = _build_progress_card(
+                    self._decorate_progress_body(chat_id, self._progress_card_bodies.get(folded_id, "")),
+                    count=self._progress_card_counts.get(folded_id, 0),
+                    final_text=self._final_card_text.get(folded_id),
+                    bg_tasks=tasks,
+                    subagents=self._subagent_lines(chat_id),
+                    elapsed_s=self._turn_elapsed(chat_id),
+                    finished_at=self._turn_ended_at.get(chat_id),
+                    stopped=self._turn_stopped(chat_id),
+                )
+                folded_payload = json.dumps(card, ensure_ascii=False)
+                # Feishu caps a card update at 30 KB; fall through to a standalone card past that.
+                if len(folded_payload.encode("utf-8")) <= 28000:
+                    if await self._cardkit_update_card(chat_id, card):
+                        return SendResult(success=True, message_id=folded_id)
+                    request_body = self._build_update_message_body(msg_type=None, content=folded_payload)
+                    request = self._build_update_message_request(message_id=folded_id, request_body=request_body)
+                    patch = getattr(HttpMethod, "PATCH", None)
+                    if patch is not None:
+                        request.http_method = patch
+                    response = await self._run_blocking(self._client.im.v1.message.update, request)
+                    result = self._finalize_send_result(response, "turn card update failed")
+                    if result.success:
+                        result.message_id = folded_id
+                        return result
+                    logger.info("[Feishu] folding background tasks into the turn card failed: %s", result.error)
+                    if self._final_card_by_chat.get(chat_id) == folded_id:
+                        self._final_card_by_chat.pop(chat_id, None)
+            # No turn card to fold into: stay silent rather than spawn a standalone panel bubble
+            # that reads as another fragment of the conversation.
+            return SendResult(success=True)
+        except Exception as exc:
+            logger.warning("[Feishu] background task card build failed: %s", exc)
+            return SendResult(success=False, error=str(exc))
+    async def edit_message(
+        self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
+        metadata: Optional[dict[str, Any]] = None,
+    ) -> SendResult:
+        """Edit a previously sent Feishu text/post message (or folded progress card)."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
 
-        async def _update(msg_type: str, payload: str) -> SendResult:
+        async def _update(msg_type: Optional[str], payload: str, *, method: Any = None) -> SendResult:
+            # Card updates go through the CardKit entity when this chat's card has one: same
+            # content, sequence-guarded, no message rewrite.
+            if msg_type is None:
+                try:
+                    _card_obj = json.loads(payload)
+                    if isinstance(_card_obj, dict) and _card_obj.get("schema"):
+                        if await self._cardkit_update_card(chat_id, _card_obj):
+                            return SendResult(success=True, message_id=message_id)
+                except Exception:
+                    logger.debug("[Feishu] cardkit update path skipped", exc_info=True)
             body = self._build_update_message_body(msg_type=msg_type, content=payload)
             request = self._build_update_message_request(message_id=message_id, request_body=body)
+            if method is not None:
+                # The SDK builds this request as PUT, which Feishu rejects for interactive
+                # cards ("field validation failed"); card updates must go out as PATCH.
+                request.http_method = method
             response = await self._run_blocking(self._client.im.v1.message.update, request)
             return self._finalize_send_result(response, "update failed")
+
+        # Folded progress card: rebuild the collapsible panel and replace it in place. The
+        # metadata marker survives a gateway restart, so an in-flight card keeps updating even
+        # when the in-memory registry is gone.
+        is_progress_card = bool(metadata and metadata.get("feishu_progress_card")) or (
+            message_id in self._progress_card_counts
+        )
+        if is_progress_card:
+            try:
+                card_payload = json.dumps(
+                    _build_progress_card(
+                        self._decorate_progress_body(chat_id, content), count=_progress_tool_count(metadata),
+                        reply_open_id=_progress_reply_open_id(metadata),
+                        bg_tasks=self._bg_task_card_tasks.get(chat_id),
+                        subagents=self._subagent_lines(chat_id),
+                        elapsed_s=self._turn_elapsed(chat_id),
+                        status_label=self._status_label(chat_id),
+                        stop_value=self._stop_payload(chat_id),
+                    ), ensure_ascii=False,
+                )
+                result = await _update(None, card_payload, method=getattr(HttpMethod, "PATCH", None))
+                if result.success:
+                    result.message_id = message_id
+                    self._progress_card_bodies[message_id] = content
+                    self._last_progress_at[chat_id] = time.time()
+                    count = _progress_tool_count(metadata)
+                    if count:
+                        self._progress_card_counts[message_id] = count
+                    self._progress_card_by_chat[chat_id] = message_id
+                    return result
+                # A card cannot be downgraded to text/post in place; report the failure so the
+                # caller keeps the previous card instead of destroying it.
+                logger.warning("[Feishu] Progress card update rejected: %s", result.error)
+                return result
+            except Exception as exc:
+                logger.warning("[Feishu] Progress card update failed: %s", exc)
+                return SendResult(success=False, error=str(exc))
 
         try:
             msg_type, payload = self._build_outbound_payload(content)
@@ -2265,7 +3404,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         return verdict
 
     @staticmethod
-    def _card_response(card_data: Optional[dict[str, Any]] = None) -> Any:
+    def _card_response(card_data: Optional[dict[str, Any]] = None, toast: Optional[str] = None) -> Any:
         """Synchronous card-callback response; ``card_data`` updates the card inline."""
         if P2CardActionTriggerResponse is None:
             return None
@@ -2275,6 +3414,11 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             card.type = "raw"
             card.data = card_data
             response.card = card
+        if toast and CallBackToast is not None:
+            note = CallBackToast()
+            note.type = "info"
+            note.content = str(toast)
+            response.toast = note
         return response
 
     def _card_toast(self, text: str) -> Any:
@@ -2353,6 +3497,85 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         if not self._submit_on_loop(loop, coro):
             return self._card_response()
         return self._card_response(self._build_resolved_update_prompt_card(answer=answer, user_name=user_name))
+
+    # --- Turn card stop button -------------------------------------------------
+
+    def _stop_payload(self, chat_id: str) -> Optional[dict[str, Any]]:
+        """Card value for the running turn's stop button, or None when it must not render."""
+        turn_started = self._turn_started_at.get(chat_id)
+        if turn_started is None:
+            return None
+        if str(getattr(self, "_stop_button_scope", "all") or "all").lower() == "off":
+            return None
+        return {"hermes_stop_action": {"chat_id": chat_id, "turn_id": f"{turn_started:.3f}"}}
+
+    def _turn_stopped(self, chat_id: str) -> bool:
+        """Whether the card's current turn was ended by a stop click (labels the finished card)."""
+        stopped = self._stopped_turns.get(chat_id)
+        return stopped is not None and stopped == self._turn_started_at.get(chat_id)
+
+    def _stop_operator_allowed(
+        self, *, open_id: str, user_id: str = "", union_id: str = "", chat_id: str = "",
+    ) -> bool:
+        """Apply ``feishu.stop_button_scope`` on top of the gateway's own authorization."""
+        if not self._is_interactive_operator_authorized(
+            open_id, user_id=user_id, union_id=union_id, chat_id=chat_id,
+        ):
+            return False
+        scope = str(getattr(self, "_stop_button_scope", "all") or "all").strip().lower()
+        if scope == "all":
+            return True
+        ids = {str(v or "").strip() for v in (open_id, user_id, union_id)} - {""}
+        privileged = set(self._admins) | set(self._allowed_group_users)
+        if "*" in privileged or (ids & privileged):
+            return True
+        if scope == "starter":
+            owner = str(self._turn_owner.get(chat_id) or "").strip()
+            return bool(owner) and owner in ids
+        return False
+
+    def _handle_stop_card_action(self, *, event: Any, action_value: dict[str, Any], loop: Any) -> Any:
+        """Stop button: replay the click as the same ``/stop`` a typed command would run.
+
+        Synthesizing the command keeps one implementation of "stop": the busy path hard-stops
+        the running agent and releases the session lock, the idle path clears a pending sentinel
+        or reports that nothing is running. Duplicating the interrupt here would drift.
+        """
+        payload = action_value.get("hermes_stop_action")
+        if not isinstance(payload, dict):
+            logger.debug("[Feishu] Stop action without a payload, ignoring")
+            return self._card_response()
+        chat_id = str(payload.get("chat_id") or "").strip()
+        turn_id = str(payload.get("turn_id") or "").strip()
+        operator = getattr(event, "operator", None)
+        open_id = str(getattr(operator, "open_id", "") or "")
+        user_id = str(getattr(operator, "user_id", "") or "")
+        union_id = str(getattr(operator, "union_id", "") or "")
+        callback_chat_id = str(getattr(getattr(event, "context", None), "open_chat_id", "") or "")
+        if not chat_id or (callback_chat_id and callback_chat_id != chat_id):
+            logger.warning("[Feishu] Stop click chat mismatch (card=%r, callback=%r)", chat_id, callback_chat_id)
+            return self._card_response()
+        if not self._stop_operator_allowed(
+            open_id=open_id, user_id=user_id, union_id=union_id, chat_id=chat_id,
+        ):
+            logger.warning("[Feishu] Unauthorized stop click by %s in %s", open_id or "<unknown>", chat_id)
+            return self._card_response(toast="你没有停止这一轮的权限")
+        current_turn = f"{self._turn_started_at.get(chat_id, 0.0):.3f}"
+        if turn_id and turn_id != current_turn:
+            # The card is from an earlier turn (or another bot's rotation of the same chat).
+            logger.info("[Feishu] Stop click on a finished turn (%s != %s) in %s", turn_id, current_turn, chat_id)
+            return self._card_response(toast="这一轮已经结束了")
+        coro = self._dispatch_synthetic_event(
+            text="/stop", message_type=MessageType.COMMAND, chat_id=chat_id,
+            sender_id=SimpleNamespace(open_id=open_id, user_id=user_id or None, union_id=union_id or None),
+            event_chat_type="group", raw_message=event, message_id=f"stop-{turn_id or chat_id}",
+        )
+        self._stopped_turns[chat_id] = self._turn_started_at.get(chat_id, 0.0)
+        if not self._submit_on_loop(loop, coro):
+            self._stopped_turns.pop(chat_id, None)
+            return self._card_response()
+        logger.info("[Feishu] Stop button pressed by %s in %s (turn %s)", open_id or "<unknown>", chat_id, turn_id)
+        return self._card_response(toast="正在停止…")
 
     def _pop_validated_prompt_state(
         self, *, states: dict[int, dict[str, str]], ident: Any, label: str, open_id: str, chat_id: str,
@@ -3960,7 +5183,11 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         return _sdk_build(ReplyMessageRequest, message_id=message_id, request_body=request_body)
 
     @staticmethod
-    def _build_update_message_body(*, msg_type: str, content: str) -> Any:
+    def _build_update_message_body(*, msg_type: Optional[str], content: str) -> Any:
+        # Feishu rejects ``msg_type=interactive`` on update ("invalid msg_type"); omitting the
+        # field is what lets an interactive card be replaced in place.
+        if msg_type is None:
+            return _sdk_build(UpdateMessageRequestBody, content=content)
         return _sdk_build(UpdateMessageRequestBody, msg_type=msg_type, content=content)
 
     @staticmethod

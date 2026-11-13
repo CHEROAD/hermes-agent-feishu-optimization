@@ -207,6 +207,11 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             self._clear_session_env(_session_env_tokens)
             return None
         history, message_text = prepared.history, prepared.message_text
+        # Explicit defaults for the finally block below, which decides whether this turn
+        # delivered anything. Reading locals() by name would break silently on a rename.
+        agent_result: Any = None
+        response: Any = None
+        _intentional_silence = False
 
         try:
             # Capture the launch session id so post-run compression publication is identity-guarded
@@ -217,6 +222,27 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             # turn preparation gates have passed when the agent runner is entered.
             event._heartbeat_execution_started = True
             _turn_channel_prompt, _turn_source = channel
+            # Feishu: open the turn card up front so the chat sees a live status before the
+            # first tool call — and even when the model only thinks and never calls a tool.
+            if source.platform == Platform.FEISHU:
+                _fc_adapter = self._delivery_adapter_for(source)
+                _begin_card = getattr(_fc_adapter, "begin_turn_card", None)
+                if callable(_begin_card) and getattr(source, "chat_id", None):
+                    try:
+                        _card_meta: dict[str, Any] = {}
+                        if source.user_id:
+                            _card_meta["reply_open_id"] = source.user_id
+                        # Topic groups need the thread id or the card lands in the main chat.
+                        if getattr(source, "thread_id", None):
+                            _card_meta["thread_id"] = str(source.thread_id)
+                        await _begin_card(
+                            source.chat_id,
+                            reply_to=self._reply_anchor_for_event(event),
+                            metadata=_card_meta or None,
+                            internal=bool(getattr(event, "internal", False)),
+                        )
+                    except Exception:
+                        logger.debug("feishu turn card open failed", exc_info=True)
             agent_result = await self._run_agent(
                 message=message_text, context_prompt=prepared.context_prompt, history=history, source=_turn_source,
                 session_id=_run_start_session_id, session_key=session_key,
@@ -298,6 +324,25 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
         finally:
             # Restore session context variables to their pre-handler state
             self._clear_session_env(_session_env_tokens)
+            # Feishu opens the turn card when the message arrives. A turn can then end without
+            # ever delivering an answer — a newer run superseded it, the gateway drained for a
+            # restart, the agent raised — and that card would keep its spinner for good, which
+            # reads in chat as "stuck, no reply". Close it only when NOTHING went out this turn.
+            try:
+                _delivered = bool(
+                    (isinstance(response, str) and response.strip())
+                    or (isinstance(agent_result, dict) and agent_result.get("already_sent"))
+                    # A muted notice turn is deliberately silent — not a dropped answer.
+                    or _intentional_silence
+                )
+                if (not _delivered and source.platform == Platform.FEISHU
+                        and getattr(source, "chat_id", None)):
+                    _fc_adapter = self._delivery_adapter_for(source)
+                    _abandon = getattr(_fc_adapter, "abandon_progress_card", None)
+                    if callable(_abandon):
+                        await _abandon(source.chat_id)
+            except Exception:
+                logger.debug("feishu abandoned turn card cleanup failed", exc_info=True)
 
     def _profile_scope_for_source(self, source: SessionSource):
         """``_profile_runtime_scope`` for ``source``'s profile when a secret scope is required.
@@ -1049,6 +1094,15 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             ),
             platform=source.platform,
         )
+        if source.platform == Platform.FEISHU:
+            # Feishu renders tool progress as a collapsed interactive card instead of a
+            # growing post bubble; the adapter owns the card shape and the in-place edits.
+            _progress_metadata = dict(_progress_metadata or {})
+            _progress_metadata["feishu_progress_card"] = True
+            # Card JSON only accepts a real open_id in an at node; without this the reply's
+            # "<at user_id=\"@_user_N\">" placeholder fails the card (230099/100290).
+            if source.user_id:
+                _progress_metadata["reply_open_id"] = source.user_id
         if _native_slack_task_cards:
             # chat.startStream in channels requires the recipient team/user pair; harmless elsewhere.
             _progress_metadata = dict(_progress_metadata or {})

@@ -316,6 +316,13 @@ class GatewayTurnPersistenceMixin:
         except Exception as e:
             logger.debug("Watch queue drain error: %s", e)
 
+        # Feishu: refresh the background-task panel after the drain so a job that finished
+        # during this turn shows its exit code, and a long job shows as still running.
+        try:
+            await self._refresh_bg_task_panel()
+        except Exception as e:
+            logger.debug("bg task panel refresh error: %s", e)
+
     # One owner for the boundary copy (agent/turn_failure_copy.py): the core closer in
     # agent/conversation_loop.py writes the same row on the paths that never reach this layer.
 
@@ -831,6 +838,24 @@ class GatewayTurnPersistenceMixin:
             with suppress(Exception):
                 event._streamed_final_response = str(response or "")
             return None
+
+        # Fold the answer into the turn's progress card when the platform keeps one, so a
+        # turn that ran tools still occupies a single message.
+        if response and adapter is not None and not agent_result.get("failed"):
+            _folder = getattr(adapter, "append_final_to_progress_card", None)
+            if callable(_folder):
+                try:
+                    _fold_meta = {"reply_open_id": getattr(source, "user_id", None)}
+                    _folded = _folder(source.chat_id, response, _fold_meta)
+                    if inspect.isawaitable(_folded):
+                        _folded = await _folded
+                    if _folded:
+                        with suppress(Exception):
+                            event._streamed_final_response = str(response or "")
+                        agent_result["already_sent"] = True
+                        return None
+                except Exception as _fold_err:
+                    logger.debug("folding final into the progress card failed: %s", _fold_err)
 
         return response
 
