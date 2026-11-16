@@ -2373,13 +2373,14 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         card = _build_progress_card(
             self._decorate_progress_body(chat_id, self._progress_card_bodies.get(message_id, "")),
             count=self._progress_card_counts.get(message_id, 0),
-            final_text=self._final_card_text.get(message_id),
+            final_text=self._card_final_text(chat_id, message_id),
             bg_tasks=self._bg_task_card_tasks.get(chat_id),
             subagents=self._subagent_lines(chat_id),
             elapsed_s=self._turn_elapsed(chat_id),
-            finished_at=self._turn_ended_at.get(chat_id),
+            finished_at=self._card_finished_at(chat_id, message_id),
             stopped=self._turn_stopped(chat_id),
             status_label=self._status_label(chat_id),
+            stop_value=self._stop_payload(chat_id),
         )
         payload = json.dumps(card, ensure_ascii=False)
         if len(payload.encode("utf-8")) > 28000:
@@ -2829,12 +2830,13 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
                 card = _build_progress_card(
                     self._decorate_progress_body(chat_id, self._progress_card_bodies.get(folded_id, "")),
                     count=self._progress_card_counts.get(folded_id, 0),
-                    final_text=self._final_card_text.get(folded_id),
+                    final_text=self._card_final_text(chat_id, folded_id),
                     bg_tasks=tasks,
                     subagents=self._subagent_lines(chat_id),
                     elapsed_s=self._turn_elapsed(chat_id),
-                    finished_at=self._turn_ended_at.get(chat_id),
+                    finished_at=self._card_finished_at(chat_id, folded_id),
                     stopped=self._turn_stopped(chat_id),
+                    stop_value=self._stop_payload(chat_id),
                 )
                 folded_payload = json.dumps(card, ensure_ascii=False)
                 # Feishu caps a card update at 30 KB; fall through to a standalone card past that.
@@ -3534,6 +3536,31 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             "chat_id": chat_id or key.split("|", 1)[0],
             "turn_id": f"{turn_started:.3f}", "turn_key": key,
         }}
+
+    def _card_final_text(self, key: str, message_id: Optional[str]) -> Optional[str]:
+        """Answer text for a card rebuild — only once that card stopped being the live one.
+
+        A notice-driven turn can fold its answer into a chat's live card. If the user's turn is
+        still running, that folded text made every later rebuild render a finished card (⏱ 总耗时,
+        no stop button) for a turn that had not ended.
+        """
+        if not message_id:
+            return None
+        if self._progress_card_by_chat.get(key) == message_id:
+            return None
+        return self._final_card_text.get(message_id)
+
+    def _card_finished_at(self, key: str, message_id: Optional[str]) -> Optional[float]:
+        """End time for a card rebuild — only once that card is the turn's retired bubble.
+
+        Two mid-turn paths (the status-refresh fallback and the background-task card) rebuild
+        the whole card. Handing them ``_turn_ended_at`` unconditionally printed ``⏱ 总耗时`` on
+        a turn that was still running; refusing it unconditionally dropped the same footer from
+        the finished card. The retired-final-card check separates the two cases.
+        """
+        if message_id and self._final_card_by_chat.get(key) == message_id:
+            return self._turn_ended_at.get(key)
+        return None
 
     def _turn_stopped(self, key: str) -> bool:
         """Whether the card's current turn was ended by a stop click (labels the finished card)."""

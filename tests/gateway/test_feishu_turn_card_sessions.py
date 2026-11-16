@@ -15,6 +15,7 @@ dicts, so a future refactor that drops ``session_key`` fails here.
 from __future__ import annotations
 
 import asyncio
+import json
 from collections import OrderedDict
 from pathlib import Path
 from types import SimpleNamespace
@@ -202,6 +203,101 @@ def _ok():
     from gateway.platforms.base import SendResult
 
     return SendResult(success=True)
+
+
+def _capture_rebuilt_card(adapter, session, *, bg_tasks=None, via="bg"):
+    """Run a mid-turn card rebuild and return the card dict it pushed."""
+    keys = adapter._turn_key("oc_group", session)
+    captured = {}
+
+    async def _update(chat_id, card):
+        captured["chat_id"] = chat_id
+        captured["card"] = card
+        return True
+
+    async def _patch(element_id, partial):
+        return False
+
+    adapter._cardkit_update_card = _update
+    if via == "status":
+        from gateway.platforms.base import SendResult
+
+        # The status fallback PATCHes the message itself; capture the card it builds.
+        def _body(**kwargs):
+            captured["card"] = json.loads(kwargs["content"])
+            return {"content": kwargs["content"]}
+
+        async def _update_msg(req):
+            return SimpleNamespace(code=0, msg="ok")
+
+        adapter._cardkit_patch_element = lambda chat_id, element_id, partial: _async_false()
+        adapter._build_update_message_body = _body
+        adapter._build_update_message_request = lambda **k: SimpleNamespace(http_method=None)
+        adapter._run_blocking = lambda fn, req: _awaitable(SimpleNamespace(code=0, msg="ok"))
+        adapter._finalize_send_result = lambda r, m: SendResult(success=True)
+        asyncio.run(adapter._refresh_status_card(keys))
+    else:
+        asyncio.run(adapter.update_background_tasks_card(
+            "oc_group", bg_tasks if bg_tasks is not None else [{"id": "p1", "status": "running", "command": "sleep 60"}],
+            session_key=session,
+        ))
+    return captured["card"]
+
+
+def _stop_buttons(card):
+    return [e for e in card["body"]["elements"] if e.get("element_id") == "stop_btn"]
+
+
+def _footer_text(card):
+    return next(e for e in card["body"]["elements"] if e.get("element_id") == "footer")["content"]
+
+
+def test_background_task_patch_keeps_the_stop_button():
+    """A bg-task refresh mid-turn must not drop the stop button or claim the turn finished."""
+    a = _adapter()
+    asyncio.run(a.begin_turn_card(chat, session_key="sess-A"))
+
+    card = _capture_rebuilt_card(a, "sess-A", via="bg")
+
+    assert len(_stop_buttons(card)) == 1, "bg-task rebuild dropped the stop button"
+    assert "总耗时" not in _footer_text(card), "bg-task rebuild rendered a finished footer mid-turn"
+    assert _footer_text(card).startswith("⏳")
+
+
+def test_answers_folded_into_a_live_card_do_not_finish_it():
+    """A notice turn's fold must not turn the running card into a finished one (the report)."""
+    a = _adapter()
+    asyncio.run(a.begin_turn_card(chat, session_key="sess-A"))
+    a._final_card_text["msg-1"] = "通知：后台任务完成"   # folded while the turn still runs
+
+    card = _capture_rebuilt_card(a, "sess-A", via="bg")
+
+    assert "总耗时" not in _footer_text(card)
+    assert _footer_text(card).startswith("⏳")
+    assert len(_stop_buttons(card)) == 1
+
+
+def test_status_refresh_patch_keeps_the_stop_button():
+    """The status patch falls back to a whole-card rebuild; that path must keep the button too."""
+    a = _adapter()
+    asyncio.run(a.begin_turn_card(chat, session_key="sess-A"))
+
+    card = _capture_rebuilt_card(a, "sess-A", via="status")
+
+    assert len(_stop_buttons(card)) == 1, "status-refresh rebuild dropped the stop button"
+    assert "总耗时" not in _footer_text(card)
+
+
+def test_final_card_still_reports_the_total_time():
+    """The fix must not flatten the finished state: the retired final card keeps ⏱ 总耗时."""
+    a = _adapter()
+    asyncio.run(a.begin_turn_card(chat, session_key="sess-A"))
+    key = _key(a, "sess-A")
+    a._final_card_text["msg-1"] = "答案"          # the answer folded into the card
+    a.clear_progress_card(chat, session_key="sess-A")
+
+    card = _capture_rebuilt_card(a, "sess-A", via="bg")
+    assert "总耗时" in _footer_text(card)
 
 
 if __name__ == "__main__":
