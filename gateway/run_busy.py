@@ -1058,6 +1058,7 @@ class GatewayBusySessionMixin:
                     _note(
                         _src.chat_id,
                         "redirect" if is_redirect_mode else "steer",
+                        session_key=session_key,
                     )
                     return
             except Exception:

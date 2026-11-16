@@ -845,7 +845,8 @@ class GatewayTurnPersistenceMixin:
             if callable(_folder):
                 try:
                     _fold_meta = {"reply_open_id": getattr(source, "user_id", None)}
-                    _folded = _folder(source.chat_id, response, _fold_meta)
+                    _folded = _folder(source.chat_id, response, _fold_meta,
+                                      session_key=session_key)
                     if inspect.isawaitable(_folded):
                         _folded = await _folded
                     if _folded:

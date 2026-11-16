@@ -238,6 +238,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                             reply_to=self._reply_anchor_for_event(event),
                             metadata=_card_meta or None,
                             internal=bool(getattr(event, "internal", False)),
+                            session_key=session_key,
                         )
                     except Exception:
                         logger.debug("feishu turn card open failed", exc_info=True)
@@ -338,7 +339,7 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
                     _fc_adapter = self._delivery_adapter_for(source)
                     _abandon = getattr(_fc_adapter, "abandon_progress_card", None)
                     if callable(_abandon):
-                        await _abandon(source.chat_id)
+                        await _abandon(source.chat_id, session_key=session_key)
             except Exception:
                 logger.debug("feishu abandoned turn card cleanup failed", exc_info=True)
 

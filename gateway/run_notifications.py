@@ -1858,6 +1858,7 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             if updater is None:
                 return
             by_chat: dict[str, list[dict]] = {}
+            _key_by_chat: dict[str, set[str]] = {}
             for s in self._bg_process_sessions():
                 if getattr(s, "watcher_platform", "") != "feishu":
                     continue
@@ -1870,6 +1871,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
                 duration = max(0.0, (ended if (is_exited and ended) else time.time()) - started) if started else None
                 exit_code = getattr(s, "exit_code", None) if is_exited else None
                 status = ("done" if exit_code in (0, None) else "failed") if is_exited else "running"
+                _key_by_chat.setdefault(chat, set()).add(
+                    str(getattr(s, "watcher_session_key", "") or ""))
                 by_chat.setdefault(chat, []).append({
                     "id": getattr(s, "id", ""),
                     "command": _shorten_command_for_display(
@@ -1885,7 +1888,9 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             for chat, tasks in by_chat.items():
                 hidden = shown.get(chat, set())
                 visible = [t for t in tasks if t.get("status") == "running" or t.get("id") not in hidden]
-                await updater(chat, visible[-12:])
+                _keys = _key_by_chat.get(chat) or {""}
+                await updater(chat, visible[-12:],
+                              session_key=(next(iter(_keys)) if len(_keys) == 1 else None))
                 shown[chat] = {t.get("id", "") for t in visible if t.get("id")}
                 logger.info(
                     "[bg-card] refresh chat=%r tasks=%d (hidden=%d)",

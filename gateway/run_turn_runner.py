@@ -795,7 +795,7 @@ class TurnRunner(GatewayTurnProgressMixin, GatewaySessionAgentMixin):
             fn = getattr(ctx._status_adapter, "note_agent_status", None)
             chat_id = getattr(ctx, "_status_chat_id", None)
             if callable(fn) and chat_id:
-                fn(chat_id, "waiting")
+                fn(chat_id, "waiting", session_key=getattr(ctx, "session_key", None))
         except Exception:
             logger.debug("feishu waiting status failed", exc_info=True)
 

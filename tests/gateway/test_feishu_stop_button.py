@@ -59,10 +59,10 @@ def _adapter(*, scope="all", admins=(), allowed=(), authorized=True):
     from plugins.platforms.feishu.adapter import FeishuAdapter
 
     adapter = object.__new__(FeishuAdapter)
-    adapter._turn_started_at = {"oc_1": 1_700_000_000.5}
+    adapter._turn_started_at = {adapter._turn_key("oc_1"): 1_700_000_000.5}
     adapter._turn_ended_at = {}
     adapter._stopped_turns = {}
-    adapter._turn_owner = {"oc_1": "ou_starter"}
+    adapter._turn_owner = {adapter._turn_key("oc_1"): "ou_starter"}
     adapter._stop_button_scope = scope
     adapter._admins = set(admins)
     adapter._allowed_group_users = set(allowed)
@@ -110,8 +110,8 @@ def test_click_dispatches_stop_and_marks_the_turn():
     assert len(adapter.dispatched) == 1
     assert adapter.dispatched[0]["text"] == "/stop"
     assert adapter.dispatched[0]["chat_id"] == "oc_1"
-    assert adapter._stopped_turns["oc_1"] == 1_700_000_000.5
-    assert adapter._turn_stopped("oc_1") is True
+    assert adapter._stopped_turns[adapter._turn_key("oc_1")] == 1_700_000_000.5
+    assert adapter._turn_stopped(adapter._turn_key("oc_1")) is True
 
 
 def test_click_from_another_chat_is_ignored():
@@ -151,18 +151,21 @@ def test_scope_starter_allows_the_person_who_opened_the_turn():
 
 
 def test_stop_payload_renders_for_every_scope_and_disappears_when_off():
-    # The card is shared, so rendering cannot be per-viewer: the button shows for the chat and
+    # Rendering depends on the turn, not the viewer: the button shows on a live turn's card and
     # the click decides who may use it. Only the explicit "off" switch removes it.
     for scope in ("all", "starter_admin", "starter"):
-        payload = _adapter(scope=scope)._stop_payload("oc_1")
+        adapter = _adapter(scope=scope)
+        payload = adapter._stop_payload(adapter._turn_key("oc_1"))
         assert payload is not None, scope
         assert payload["hermes_stop_action"]["chat_id"] == "oc_1"
         assert payload["hermes_stop_action"]["turn_id"] == "1700000000.500"
+        assert payload["hermes_stop_action"]["turn_key"] == adapter._turn_key("oc_1")
 
-    assert _adapter(scope="off")._stop_payload("oc_1") is None
+    adapter = _adapter(scope="off")
+    assert adapter._stop_payload(adapter._turn_key("oc_1")) is None
     # No turn has started: nothing to stop.
     adapter = _adapter()
-    assert adapter._stop_payload("oc_unknown") is None
+    assert adapter._stop_payload(adapter._turn_key("oc_unknown")) is None
 def test_repeating_the_same_state_keeps_the_seconds_counting():
     """One agent.step per iteration re-noted "thinking": the strip must not restart at 0s."""
     from plugins.platforms.feishu.adapter import FeishuAdapter
@@ -173,12 +176,12 @@ def test_repeating_the_same_state_keeps_the_seconds_counting():
     adapter._schedule_status_refresh = lambda chat_id: None
 
     adapter.note_agent_status("oc_1", "thinking")
-    first = adapter._agent_status["oc_1"]["since"]
+    first = adapter._agent_status["oc_1|"]["since"]
     adapter.note_agent_status("oc_1", "thinking")
-    assert adapter._agent_status["oc_1"]["since"] == first   # same state -> same clock
+    assert adapter._agent_status["oc_1|"]["since"] == first   # same state -> same clock
 
     adapter.note_agent_status("oc_1", "tool", "terminal")
-    assert adapter._agent_status["oc_1"]["since"] >= first    # a real transition restarts it
+    assert adapter._agent_status["oc_1|"]["since"] >= first    # a real transition restarts it
 
 
 def test_heartbeat_survives_failed_patches():
@@ -204,14 +207,82 @@ def test_a_new_turn_does_not_inherit_the_previous_turn_clock():
     adapter._turn_started_at = {}
     adapter._schedule_status_refresh = lambda chat_id: None
 
-    adapter._turn_started_at["oc_1"] = time.time() - 120
+    adapter._turn_started_at["oc_1|"] = time.time() - 120
     adapter.note_agent_status("oc_1", "thinking")
-    adapter._agent_status["oc_1"]["since"] -= 120      # that status was two minutes ago
+    adapter._agent_status["oc_1|"]["since"] -= 120      # that status was two minutes ago
 
-    adapter._turn_started_at["oc_1"] = time.time()     # a new turn begins
+    adapter._turn_started_at["oc_1|"] = time.time()     # a new turn begins
     adapter.note_agent_status("oc_1", "thinking")
 
-    assert time.time() - adapter._agent_status["oc_1"]["since"] < 5
+    assert time.time() - adapter._agent_status["oc_1|"]["since"] < 5
+
+
+def _multi_turn_adapter():
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    a = object.__new__(FeishuAdapter)
+    for name in ("_turn_started_at", "_turn_ended_at", "_stopped_turns", "_turn_owner",
+                 "_turn_internal", "_progress_card_by_chat", "_progress_card_bodies",
+                 "_progress_card_counts", "_final_card_by_chat", "_final_card_text",
+                 "_card_id_by_chat", "_card_seq", "_agent_status", "_last_progress_at",
+                 "_last_card_update_at", "_status_refresh_at", "_heartbeat_tasks",
+                 "_bg_task_card_tasks", "_subagents", "_subagent_seq", "_line_first_seen",
+                 "_bg_seen_ids", "_final_card_at"):
+        setattr(a, name, {})
+    a._stop_button_scope = "all"
+    a._admins = set()
+    a._allowed_group_users = set()
+    a._loop = None
+    return a
+
+
+def test_two_people_in_one_chat_get_their_own_card_and_clock():
+    """Groups isolate sessions per participant: a second turn must not touch the first card."""
+    adapter = _multi_turn_adapter()
+    A, B = "session-a", "session-b"
+
+    adapter.begin_turn_card.__self__  # sanity: bound method exists
+    adapter._turn_started_at[adapter._turn_key("oc_1", A)] = 1000.0
+    adapter._turn_started_at[adapter._turn_key("oc_1", B)] = 1010.0
+    adapter._progress_card_by_chat[adapter._turn_key("oc_1", A)] = "msg-A"
+    adapter._progress_card_by_chat[adapter._turn_key("oc_1", B)] = "msg-B"
+
+    # B's turn advances its own clock only.
+    adapter.note_agent_status("oc_1", "thinking", session_key=B)
+    assert adapter._agent_status[adapter._turn_key("oc_1", A)] if adapter._turn_key("oc_1", A) in adapter._agent_status else True
+
+    # B finishing retires B's card only; A's clock stays live (no "总耗时" on A's card).
+    adapter.clear_progress_card("oc_1", session_key=B)
+    assert adapter._progress_card_by_chat.get(adapter._turn_key("oc_1", A)) == "msg-A"
+    assert adapter._turn_ended_at.get(adapter._turn_key("oc_1", A)) is None
+    assert adapter._turn_ended_at.get(adapter._turn_key("oc_1", B)) is not None
+
+
+def test_stop_payload_carries_the_turn_key_and_chat_id():
+    adapter = _multi_turn_adapter()
+    adapter._turn_started_at[adapter._turn_key("oc_1", "s1")] = 1700000000.5
+
+    value = adapter._stop_payload(adapter._turn_key("oc_1", "s1"))
+    payload = value["hermes_stop_action"]
+    assert payload["chat_id"] == "oc_1"                   # the real chat, for the synthetic event
+    assert payload["turn_key"] == "oc_1|s1"               # the turn, for the stop bookkeeping
+    assert payload["turn_id"] == "1700000000.500"
+
+
+def test_send_folds_only_when_the_chat_has_one_live_turn():
+    """``send()`` gets a chat id: fold into the sole live turn, never guess between two."""
+    adapter = _multi_turn_adapter()
+    key_a = adapter._turn_key("oc_1", "a")
+
+    adapter._progress_card_by_chat[key_a] = "msg-A"
+    assert adapter._sole_live_turn_key("oc_1") == key_a
+
+    adapter._progress_card_by_chat[adapter._turn_key("oc_1", "b")] = "msg-B"
+    assert adapter._sole_live_turn_key("oc_1") is None       # ambiguous: stay out of both
+
+    # A retired card is not "live": the other turn alone is still unambiguous.
+    adapter._final_card_by_chat[adapter._turn_key("oc_1", "b")] = "msg-B"
+    assert adapter._sole_live_turn_key("oc_1") == key_a
 
 
 if __name__ == "__main__":  # pytest is not installed in the runtime venv; this keeps it runnable

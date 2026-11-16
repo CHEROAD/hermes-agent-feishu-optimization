@@ -2027,6 +2027,19 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             self._webhook_site = None
 
     # --- Outbound — send / edit / send_image / send_voice / … ---
+    def _sole_live_turn_key(self, chat_id: str) -> Optional[str]:
+        """The chat's live turn key when exactly one turn holds a card (send-path fallback).
+
+        ``send()`` is called with a chat id, not a session: folding interim text into a turn
+        card must not guess when two people hold live turns in the same group.
+        """
+        prefix = f"{chat_id}|"
+        live = [
+            k for k, v in self._progress_card_by_chat.items()
+            if k.startswith(prefix) and v and self._final_card_by_chat.get(k) != v
+        ]
+        return live[0] if len(live) == 1 else None
+
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
@@ -2045,13 +2058,15 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
 
         # Tool-progress lane: one collapsed card per bubble, later edits replace it in place.
         if _is_progress_card_request(metadata):
-            if self._turn_internal.get(chat_id):
+            # The card belongs to a turn (a session), not to the chat.
+            key = self._sole_live_turn_key(chat_id) or self._turn_key(chat_id)
+            if self._turn_internal.get(key):
                 # Notice-driven turn: the card on screen belongs to the user's turn — don't
                 # open another one just to report progress.
                 return SendResult(success=True)
             # The turn card may already exist (opened when the message arrived): patch that
             # bubble instead of stacking a second one on top of it.
-            _existing_card = self._progress_card_by_chat.get(chat_id)
+            _existing_card = self._progress_card_by_chat.get(key)
             if _existing_card:
                 _edited = await self.edit_message(chat_id, _existing_card, content, metadata=metadata)
                 if _edited.success:
@@ -2059,13 +2074,13 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             try:
                 card_payload = json.dumps(
                     _build_progress_card(
-                        self._decorate_progress_body(chat_id, formatted), count=_progress_tool_count(metadata),
+                        self._decorate_progress_body(key, formatted), count=_progress_tool_count(metadata),
                         reply_open_id=_progress_reply_open_id(metadata),
-                        bg_tasks=self._bg_task_card_tasks.get(chat_id),
-                        subagents=self._subagent_lines(chat_id),
-                        elapsed_s=self._turn_elapsed(chat_id),
-                        status_label=self._status_label(chat_id),
-                        stop_value=self._stop_payload(chat_id),
+                        bg_tasks=self._bg_task_card_tasks.get(key),
+                        subagents=self._subagent_lines(key),
+                        elapsed_s=self._turn_elapsed(key),
+                        status_label=self._status_label(key),
+                        stop_value=self._stop_payload(key, chat_id=chat_id),
                     ), ensure_ascii=False,
                 )
                 response = await self._feishu_send_with_retry(
@@ -2079,10 +2094,10 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
                 if result.success:
                     if result.message_id:
                         self._remember_progress_card(result.message_id)
-                        self._progress_card_by_chat[chat_id] = result.message_id
+                        self._progress_card_by_chat[key] = result.message_id
                         self._progress_card_bodies[result.message_id] = formatted
-                        self._last_progress_at[chat_id] = time.time()
-                        self._start_progress_heartbeat(chat_id, result.message_id)
+                        self._last_progress_at[key] = time.time()
+                        self._start_progress_heartbeat(key, result.message_id)
                     return result
                 logger.warning(
                     "[Feishu] Progress card rejected (%s); falling back to post/text",
@@ -2136,6 +2151,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
 
     async def append_final_to_progress_card(
         self, chat_id: str, text: str, metadata: Optional[dict[str, Any]] = None,
+        session_key: Optional[str] = None,
     ) -> bool:
         """Fold the turn's final answer into the live progress card.
 
@@ -2143,6 +2159,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         separate final message and the whole turn stays one bubble. False (no live card,
         oversized payload, or API failure) leaves the caller to send normally.
         """
+        chat_id = self._turn_key(chat_id, session_key)
         if not text or not self._client:
             return False
         message_id = self._progress_card_by_chat.get(chat_id)
@@ -2228,7 +2245,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             # One turn per card: the next turn starts a fresh one.
             self.clear_progress_card(chat_id)
 
-    async def abandon_progress_card(self, chat_id: str, note: str = "") -> None:
+    async def abandon_progress_card(self, chat_id: str, note: str = "",
+                                    session_key: Optional[str] = None) -> None:
         """Close a live turn card that will never receive an answer.
 
         A turn can end without any final message: a newer run superseded this one, the gateway
@@ -2237,6 +2255,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         next turn reuses that same bubble. Patch a terminal strip plus a short note, then retire
         the card exactly like a finished turn.
         """
+        chat_id = self._turn_key(chat_id, session_key)
         message_id = self._progress_card_by_chat.get(chat_id)
         if not message_id:
             return
@@ -2294,13 +2313,15 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         if task is not None and not task.done():
             task.cancel()
 
-    def note_agent_status(self, chat_id: str, state: str, detail: Optional[str] = None) -> None:
+    def note_agent_status(self, chat_id: str, state: str, detail: Optional[str] = None,
+                          session_key: Optional[str] = None) -> None:
         """Record what the agent is doing and stamp activity (called from gateway callbacks).
 
         state: ``thinking`` (model generating), ``tool`` (waiting on a tool), ``subagent``
         (delegation running), ``waiting`` (blocked on the user, so the heartbeat must not tick).
         A change of state patches the card right away — the timer is only the stall fallback.
         """
+        chat_id = self._turn_key(chat_id, session_key)
         now = time.time()
         prev = self._agent_status.get(chat_id) or {}
         changed = (prev.get("state"), prev.get("detail")) != (state, detail)
@@ -2375,8 +2396,9 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         except Exception:
             logger.debug("[Feishu] status refresh failed", exc_info=True)
 
-    def note_subagent_start(self, chat_id: str, name: str = "") -> int:
+    def note_subagent_start(self, chat_id: str, name: str = "", session_key: Optional[str] = None) -> int:
         """Allocate the next sub-agent row; sub-agents never replace the main status line."""
+        chat_id = self._turn_key(chat_id, session_key)
         seq = self._subagent_seq.get(chat_id, 0) + 1
         self._subagent_seq[chat_id] = seq
         rows = self._subagents.setdefault(chat_id, {})
@@ -2385,15 +2407,19 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         self._schedule_status_refresh(chat_id)
         return seq
 
-    def note_subagent_done(self, chat_id: str, seq: int, state: str = "完成") -> None:
+    def note_subagent_done(self, chat_id: str, seq: int, state: str = "完成",
+                           session_key: Optional[str] = None) -> None:
+        chat_id = self._turn_key(chat_id, session_key)
         rows = self._subagents.get(chat_id)
         if rows and seq in rows:
             rows[seq]["state"] = state
             self._last_progress_at[chat_id] = time.time()
             self._schedule_status_refresh(chat_id)
 
-    def note_all_subagents_done(self, chat_id: str, state: str = "完成") -> None:
+    def note_all_subagents_done(self, chat_id: str, state: str = "完成",
+                                session_key: Optional[str] = None) -> None:
         """Mark every unfinished sub-agent row; one delegation unit can hold several tasks."""
+        chat_id = self._turn_key(chat_id, session_key)
         rows = self._subagents.get(chat_id)
         if not rows:
             return
@@ -2405,8 +2431,10 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         if changed:
             self._schedule_status_refresh(chat_id)
 
-    def note_subagent_done_last(self, chat_id: str, state: str = "完成") -> None:
+    def note_subagent_done_last(self, chat_id: str, state: str = "完成",
+                                session_key: Optional[str] = None) -> None:
         """Flip the newest sub-agent row (the gateway's tool-complete has no sequence number)."""
+        chat_id = self._turn_key(chat_id, session_key)
         rows = self._subagents.get(chat_id) or {}
         if rows:
             self.note_subagent_done(chat_id, max(rows), state)
@@ -2585,20 +2613,36 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         return False
 
 
+    def _turn_key(self, chat_id: str, session_key: Optional[str] = None) -> str:
+        """Key for everything one turn owns: card, clock, status strip, stop button.
+
+        A group isolates sessions per participant, so two people can hold two live turns in the
+        same chat. Keying this state on ``chat_id`` made the second turn reuse the first one's
+        card, reset its clock, and retire it when the second turn ended.
+        """
+        sk = str(session_key or "").strip()
+        base = str(chat_id)
+        # Idempotent: internal call chains pass an already-keyed value back in.
+        if "|" in base:
+            return base
+        return f"{base}|{sk}" if sk else f"{base}|"
+
     async def begin_turn_card(self, chat_id: str, reply_to: Optional[str] = None,
                               metadata: Optional[dict[str, Any]] = None,
-                              internal: bool = False) -> Optional[str]:
+                              internal: bool = False,
+                              session_key: Optional[str] = None) -> Optional[str]:
         """Open the turn's progress card as soon as the message is accepted, so the chat sees
         activity before (and even without) any tool call."""
-        self._turn_internal[chat_id] = bool(internal)
+        key = self._turn_key(chat_id, session_key)
+        self._turn_internal[key] = bool(internal)
         # A notice-driven turn inherits the running clock of the user's turn.
-        if not internal or chat_id not in self._turn_started_at:
-            self._turn_started_at[chat_id] = time.time()
-            self._turn_ended_at.pop(chat_id, None)
+        if not internal or key not in self._turn_started_at:
+            self._turn_started_at[key] = time.time()
+            self._turn_ended_at.pop(key, None)
             # A fresh turn is not "stopped": clear the label an earlier turn left behind, and
             # remember who opened it for feishu.stop_button_scope=starter.
-            self._stopped_turns.pop(chat_id, None)
-            self._turn_owner[chat_id] = _progress_reply_open_id(metadata) or ""
+            self._stopped_turns.pop(key, None)
+            self._turn_owner[key] = _progress_reply_open_id(metadata) or ""
         try:
             # Remember the gateway loop first: status refreshes from callback threads need it even
             # when this turn reuses an existing bubble.
@@ -2607,30 +2651,30 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             pass
         if not self._client:
             return None
-        if internal and self._final_card_by_chat.get(chat_id):
+        if internal and self._final_card_by_chat.get(key):
             # A notice-driven turn: the bubble on screen is the user's, so answer inside it.
             return None
-        existing = self._progress_card_by_chat.get(chat_id)
-        if existing and self._final_card_by_chat.get(chat_id) == existing:
+        existing = self._progress_card_by_chat.get(key)
+        if existing and self._final_card_by_chat.get(key) == existing:
             # A retired card left behind by an abnormal end: this is a new turn, so open a fresh one.
-            self._progress_card_by_chat.pop(chat_id, None)
+            self._progress_card_by_chat.pop(key, None)
             self._progress_card_bodies.pop(existing, None)
             existing = None
         if existing:
             return None
         # A new turn starts with no jobs of its own: drop the previous turn's list so the
         # panel never opens showing stale background tasks.
-        self._bg_task_card_tasks.pop(chat_id, None)
+        self._bg_task_card_tasks.pop(key, None)
         # Fresh sub-agent numbering for this turn.
-        self._subagents.pop(chat_id, None)
-        self._subagent_seq[chat_id] = 0
-        self._line_first_seen.pop(chat_id, None)
-        self.note_agent_status(chat_id, "thinking")
+        self._subagents.pop(key, None)
+        self._subagent_seq[key] = 0
+        self._line_first_seen.pop(key, None)
+        self.note_agent_status(key, "thinking")
         card = _build_progress_card(
             "", count=0, reply_open_id=_progress_reply_open_id(metadata),
-            status_label=self._status_label(chat_id),
-            elapsed_s=self._turn_elapsed(chat_id),
-            stop_value=self._stop_payload(chat_id),
+            status_label=self._status_label(key),
+            elapsed_s=self._turn_elapsed(key),
+            stop_value=self._stop_payload(key, chat_id=chat_id),
         )
         payload = json.dumps(card, ensure_ascii=False)
         try:
@@ -2647,15 +2691,15 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             if not (result.success and result.message_id):
                 return None
             if _card_id:
-                self._card_id_by_chat[chat_id] = _card_id
-                self._card_seq[chat_id] = 0
+                self._card_id_by_chat[key] = _card_id
+                self._card_seq[key] = 0
             else:
                 # No entity this turn: drop the stale id so updates can't land on last turn's card.
-                self._card_id_by_chat.pop(chat_id, None)
+                self._card_id_by_chat.pop(key, None)
             self._remember_progress_card(result.message_id)
-            self._progress_card_by_chat[chat_id] = result.message_id
+            self._progress_card_by_chat[key] = result.message_id
             self._progress_card_bodies[result.message_id] = ""
-            self._start_progress_heartbeat(chat_id, result.message_id)
+            self._start_progress_heartbeat(key, result.message_id)
             return result.message_id
         except Exception:
             logger.debug("[Feishu] begin turn card failed", exc_info=True)
@@ -2736,12 +2780,13 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
                 logger.info("[Feishu] heartbeat iteration failed (chat=%s)", chat_id, exc_info=True)
                 await asyncio.sleep(5)
 
-    def clear_progress_card(self, chat_id: str) -> None:
+    def clear_progress_card(self, chat_id: str, session_key: Optional[str] = None) -> None:
         """Retire the chat's live progress card but keep it as the turn's final bubble.
 
         Background-task updates later patch this same card, so the order stays
         tools → background jobs → reply instead of appending a new message below the answer.
         """
+        chat_id = self._turn_key(chat_id, session_key)
         self._stop_progress_heartbeat(chat_id)
         message_id = self._progress_card_by_chat.pop(chat_id, None)
         if not message_id:
@@ -2760,7 +2805,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         self._final_card_at[chat_id] = time.time()
         self._turn_ended_at[chat_id] = time.time()
 
-    async def update_background_tasks_card(self, chat_id: str, tasks: list[dict[str, Any]]) -> SendResult:
+    async def update_background_tasks_card(self, chat_id: str, tasks: list[dict[str, Any]],
+                                           session_key: Optional[str] = None) -> SendResult:
         """Fold background-task status into the chat's turn card, between tools and the reply.
 
         Patches the live progress card, else the last finished turn's card, so the panel always
@@ -2771,6 +2817,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             return SendResult(success=False, error="Not connected")
         # Only this turn's jobs: anything already shown in an earlier turn stays hidden
         # unless it is still running.
+        chat_id = self._turn_key(chat_id, session_key)
         seen = self._bg_seen_ids.get(chat_id, set())
         tasks = [t for t in tasks if t.get("status") == "running" or t.get("id") not in seen]
         self._bg_task_card_tasks[chat_id] = list(tasks)
@@ -3476,22 +3523,26 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
 
     # --- Turn card stop button -------------------------------------------------
 
-    def _stop_payload(self, chat_id: str) -> Optional[dict[str, Any]]:
+    def _stop_payload(self, key: str, chat_id: Optional[str] = None) -> Optional[dict[str, Any]]:
         """Card value for the running turn's stop button, or None when it must not render."""
-        turn_started = self._turn_started_at.get(chat_id)
+        turn_started = self._turn_started_at.get(key)
         if turn_started is None:
             return None
         if str(getattr(self, "_stop_button_scope", "all") or "all").lower() == "off":
             return None
-        return {"hermes_stop_action": {"chat_id": chat_id, "turn_id": f"{turn_started:.3f}"}}
+        return {"hermes_stop_action": {
+            "chat_id": chat_id or key.split("|", 1)[0],
+            "turn_id": f"{turn_started:.3f}", "turn_key": key,
+        }}
 
-    def _turn_stopped(self, chat_id: str) -> bool:
+    def _turn_stopped(self, key: str) -> bool:
         """Whether the card's current turn was ended by a stop click (labels the finished card)."""
-        stopped = self._stopped_turns.get(chat_id)
-        return stopped is not None and stopped == self._turn_started_at.get(chat_id)
+        stopped = self._stopped_turns.get(key)
+        return stopped is not None and stopped == self._turn_started_at.get(key)
 
     def _stop_operator_allowed(
         self, *, open_id: str, user_id: str = "", union_id: str = "", chat_id: str = "",
+        turn_key: str = "",
     ) -> bool:
         """Apply ``feishu.stop_button_scope`` on top of the gateway's own authorization."""
         if not is_operator_authorized(
@@ -3506,7 +3557,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         if "*" in privileged or (ids & privileged):
             return True
         if scope == "starter":
-            owner = str(self._turn_owner.get(chat_id) or "").strip()
+            owner = str(self._turn_owner.get(turn_key or chat_id) or "").strip()
             return bool(owner) and owner in ids
         return False
 
@@ -3523,6 +3574,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             return self._card_response()
         chat_id = str(payload.get("chat_id") or "").strip()
         turn_id = str(payload.get("turn_id") or "").strip()
+        # Older cards carry no turn_key: fall back to the chat-scoped key so they keep working.
+        turn_key = str(payload.get("turn_key") or "").strip() or self._turn_key(chat_id)
         operator = getattr(event, "operator", None)
         open_id = str(getattr(operator, "open_id", "") or "")
         user_id = str(getattr(operator, "user_id", "") or "")
@@ -3532,11 +3585,11 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             logger.warning("[Feishu] Stop click chat mismatch (card=%r, callback=%r)", chat_id, callback_chat_id)
             return self._card_response()
         if not self._stop_operator_allowed(
-            open_id=open_id, user_id=user_id, union_id=union_id, chat_id=chat_id,
+            open_id=open_id, user_id=user_id, union_id=union_id, chat_id=chat_id, turn_key=turn_key,
         ):
             logger.warning("[Feishu] Unauthorized stop click by %s in %s", open_id or "<unknown>", chat_id)
             return self._card_response(toast="你没有停止这一轮的权限")
-        current_turn = f"{self._turn_started_at.get(chat_id, 0.0):.3f}"
+        current_turn = f"{self._turn_started_at.get(turn_key, 0.0):.3f}"
         if turn_id and turn_id != current_turn:
             # The card is from an earlier turn (or another bot's rotation of the same chat).
             logger.info("[Feishu] Stop click on a finished turn (%s != %s) in %s", turn_id, current_turn, chat_id)
@@ -3546,9 +3599,9 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             sender_id=SimpleNamespace(open_id=open_id, user_id=user_id or None, union_id=union_id or None),
             event_chat_type="group", raw_message=event, message_id=f"stop-{turn_id or chat_id}",
         )
-        self._stopped_turns[chat_id] = self._turn_started_at.get(chat_id, 0.0)
+        self._stopped_turns[turn_key] = self._turn_started_at.get(turn_key, 0.0)
         if not self._submit_on_loop(loop, coro):
-            self._stopped_turns.pop(chat_id, None)
+            self._stopped_turns.pop(turn_key, None)
             return self._card_response()
         logger.info("[Feishu] Stop button pressed by %s in %s (turn %s)", open_id or "<unknown>", chat_id, turn_id)
         return self._card_response(toast="正在停止…")

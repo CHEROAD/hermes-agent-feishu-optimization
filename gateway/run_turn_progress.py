@@ -1097,7 +1097,7 @@ class GatewayTurnProgressMixin:
             fn = getattr(adapter, "note_agent_status", None)
             chat_id = getattr(source, "chat_id", None)
             if callable(fn) and chat_id:
-                fn(chat_id, state, detail)
+                fn(chat_id, state, detail, session_key=getattr(ctx, "session_key", None))
         except Exception:
             logger.debug("feishu status note failed", exc_info=True)
 
@@ -1114,10 +1114,11 @@ class GatewayTurnProgressMixin:
                 return
             fn = getattr(adapter, "note_subagent_done_last" if done else "note_subagent_start", None)
             if callable(fn):
+                _sk = getattr(ctx, "session_key", None)
                 if done:
-                    fn(chat_id, "后台运行中")
+                    fn(chat_id, "后台运行中", session_key=_sk)
                 else:
-                    fn(chat_id, name)
+                    fn(chat_id, name, session_key=_sk)
         except Exception:
             logger.debug("feishu subagent note failed", exc_info=True)
 
