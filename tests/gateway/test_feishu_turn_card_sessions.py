@@ -300,6 +300,30 @@ def test_final_card_still_reports_the_total_time():
     assert "总耗时" in _footer_text(card)
 
 
+def test_tool_progress_after_an_answer_reuses_the_same_card():
+    """A turn that answered mid-run and then kept working used to open a second bubble."""
+    from gateway.platforms.base import SendResult
+
+    a = _adapter()
+    asyncio.run(a.begin_turn_card(chat, session_key="sess-A"))
+    a.clear_progress_card(chat, session_key="sess-A")      # answer folded while still running
+    key = _key(a, "sess-A")
+    a._agent_status[key] = {"state": "tool", "detail": "terminal", "since": 0.0}
+
+    edited = []
+
+    async def _edit(chat_id, message_id, content, metadata=None):
+        edited.append(message_id)
+        return SendResult(success=True, message_id=message_id)
+
+    a.edit_message = _edit
+    asyncio.run(a.send(chat, "🔧 terminal · new row", metadata={"feishu_progress_card": True}))
+
+    assert edited == ["msg-1"], "progress must patch the turn's existing card"
+    assert len(a.sent) == 1, "a second card bubble was opened for the same turn"
+    assert a._progress_card_by_chat.get(key) == "msg-1"
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

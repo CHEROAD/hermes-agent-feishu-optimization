@@ -2038,7 +2038,18 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             k for k, v in self._progress_card_by_chat.items()
             if k.startswith(prefix) and v and self._final_card_by_chat.get(k) != v
         ]
-        return live[0] if len(live) == 1 else None
+        if len(live) == 1:
+            return live[0]
+        if live:
+            return None
+        # A turn that answered mid-run has no live card any more, but it is still working:
+        # its retired card is the bubble this progress belongs to.
+        retired = [
+            k for k, v in self._final_card_by_chat.items()
+            if k.startswith(prefix) and v
+            and (self._agent_status.get(k) or {}).get("state") in {"tool", "thinking", "subagent"}
+        ]
+        return retired[0] if len(retired) == 1 else None
 
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
@@ -2067,6 +2078,18 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             # The turn card may already exist (opened when the message arrived): patch that
             # bubble instead of stacking a second one on top of it.
             _existing_card = self._progress_card_by_chat.get(key)
+            if not _existing_card:
+                # The turn delivered an answer mid-run and its card was retired; the next tool
+                # call used to open a SECOND bubble for the same turn ("两个窗格"). While the
+                # agent is demonstrably still working, resurrect that card instead — and drop
+                # the folded answer so it renders as running again.
+                _retired = self._final_card_by_chat.get(key)
+                _state = (self._agent_status.get(key) or {}).get("state")
+                if _retired and _state in {"tool", "thinking", "subagent"}:
+                    _existing_card = _retired
+                    self._progress_card_by_chat[key] = _retired
+                    self._final_card_by_chat.pop(key, None)
+                    self._final_card_text.pop(_retired, None)
             if _existing_card:
                 _edited = await self.edit_message(chat_id, _existing_card, content, metadata=metadata)
                 if _edited.success:
