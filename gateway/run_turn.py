@@ -277,6 +277,9 @@ class GatewayTurnMixin(GatewayBackgroundMixin, GatewayTurnPrepareMixin, GatewayT
             await self._hmwa_stop_typing_for_turn(event, source)
 
             if not self._is_session_run_current(_quick_key, run_generation):
+                # A stopped turn still owes the chat what it had already produced; only a turn
+                # displaced by a newer message stays silent.
+                await self._hmwa_deliver_stopped_partial(source, event, agent_result, session_key)
                 self._hmwa_discard_stale_result(source, _quick_key, run_generation)
                 return None
 

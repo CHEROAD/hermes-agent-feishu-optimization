@@ -481,6 +481,9 @@ class GatewayAgentCacheMixin:
         self._restore_pending_one_turn_model_override(session_key)
         generation = self._begin_session_run_generation(session_key)
         if reason:
+            # The displaced turn's result still needs to know WHY it was displaced: a stop
+            # delivers its partial answer, a newer message does not.
+            self._session_state(session_key).persistent.run_invalidation_reason = reason
             logger.info("Invalidated run generation for %s → %d (%s)", session_key, generation, reason)
         return generation
 

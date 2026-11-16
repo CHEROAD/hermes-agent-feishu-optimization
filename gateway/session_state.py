@@ -94,6 +94,9 @@ class PersistentState:
     # Legacy runner-level pending text (flushed on shutdown); not the adapter-level one.
     pending_command_text: Optional[str] = None
     run_generation: int = 0  # monotonic; NEVER reset (stale-run detection depends on it)
+    # Why the latest generation was superseded ("stop_command", "new_message", …). A stopped turn
+    # still delivers what it had produced; a superseded one stays silent.
+    run_invalidation_reason: str = ""
     # Consecutive hygiene compression failures (the in-agent ladder is unreachable: hygiene builds
     # a FRESH AIAgent per run).  Reset on success; process-local, mirrored to the DB by run.py.
     # Monotonic run-generation counter (#28686). NEVER reset: clearing it would break stale-run detection.

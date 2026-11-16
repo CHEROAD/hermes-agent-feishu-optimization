@@ -936,6 +936,42 @@ class GatewayTurnPersistenceMixin:
             t("gateway.errors.generic_failed_with_hint", hint=status_hint), PARTIAL_FAILED_TURN_NOTICE,
         ), error=local_error)
 
+    async def _hmwa_deliver_stopped_partial(self, source, event, agent_result, session_key) -> None:
+        """Deliver a stopped turn's partial answer, marked as stopped.
+
+        ``/stop`` invalidates the run generation and the in-flight result used to be dropped
+        entirely: the answer sat in the transcript but never reached the chat. Deliver it with a
+        trailing 已停止 marker, and claim ``already_sent`` so the turn's finally-block does not
+        also paint the "no output" notice over the card.
+        """
+        try:
+            if not isinstance(agent_result, dict) or agent_result.get("already_sent"):
+                return
+            reason = ""
+            try:
+                state = self._peek_session_state(session_key) if session_key else None
+                reason = str(getattr(state.persistent, "run_invalidation_reason", "") or "") if state else ""
+            except Exception:
+                reason = ""
+            if not reason.startswith("stop_command"):
+                return
+            text = str(agent_result.get("final_response") or "").strip()
+            if len(text) < 2:
+                return
+            adapter = self._delivery_adapter_for(source)
+            chat_id = getattr(source, "chat_id", None)
+            if adapter is None or not chat_id:
+                return
+            result = await adapter.send(
+                chat_id, text + "\n\n（已停止）",
+                reply_to=self._reply_anchor_for_event(event), metadata=None,
+            )
+            if getattr(result, "success", False):
+                agent_result["already_sent"] = True
+                logger.info("Delivered the partial answer of a stopped turn to %s", chat_id)
+        except Exception:
+            logger.debug("stopped-turn partial delivery failed", exc_info=True)
+
     def _hmwa_discard_stale_result(self, source, _quick_key, run_generation):
         """A newer run generation superseded this turn: drop its deferred post-delivery callback."""
         logger.info(
