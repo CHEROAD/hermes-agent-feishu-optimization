@@ -1836,7 +1836,8 @@ class GatewayNotificationsMixin(GatewayUpdateNotificationsMixin, GatewayNotifica
             visible = [t for t in tasks if t.get("status") == "running" or t.get("id") not in hidden]
             if not visible:
                 return False
-            result = await updater(chat_id, visible[-12:])
+            result = await updater(chat_id, visible[-12:],
+                                   session_key=getattr(session, "session_key", None))
             logger.info("[bg-card] updated chat=%r tasks=%d success=%s", chat_id, len(visible[-12:]), getattr(result, "success", None))
             return bool(getattr(result, "success", False))
         except Exception:
