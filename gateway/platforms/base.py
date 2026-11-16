@@ -3609,11 +3609,29 @@ class BasePlatformAdapter(_SessionModelSettingsMixin, ABC):
             # Part of a split payload is already on screen; a plain-text re-send of the whole would duplicate it.
             logger.warning("[%s] Send failed after partial delivery: %s — not re-sending as plain text", self.name, error_str)
             return result
+        if reply_to and self._is_invalid_reply_anchor(error_str):
+            # The anchor, not the markup, was rejected (Feishu 99992354 "not a valid
+            # {open_message_id}"): a quoted message was deleted, or a synthetic event carried
+            # a placeholder id. Resend once without the anchor instead of losing the text.
+            logger.warning("[%s] Reply anchor %r rejected (%s); resending without it",
+                           self.name, reply_to, error_str)
+            retry = await self.send(chat_id=chat_id, content=content, reply_to=None, metadata=metadata)
+            if retry.success:
+                return retry
+            result = retry
         logger.warning("[%s] Send failed: %s — trying plain-text fallback", self.name, error_str)
         fallback_result = await self._send_plain_fallback(chat_id, content, reply_to=reply_to, metadata=metadata)
         if not fallback_result.success:
             logger.error("[%s] Fallback send also failed: %s", self.name, fallback_result.error)
         return fallback_result
+
+    @staticmethod
+    def _is_invalid_reply_anchor(error: str) -> bool:
+        """True when the platform rejected the message being replied to, not the payload."""
+        text = (error or "").lower()
+        return ("99992354" in text
+                or "not a valid {open_message_id}" in text
+                or ("reply" in text and "not exist" in text))
 
     def _send_retry_is_final(self, result: SendResult) -> bool:
         """True when a failed send must be returned as-is: neither a retry nor the plain-text

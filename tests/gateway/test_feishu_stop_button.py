@@ -63,6 +63,8 @@ def _adapter(*, scope="all", admins=(), allowed=(), authorized=True):
     adapter._turn_ended_at = {}
     adapter._stopped_turns = {}
     adapter._turn_owner = {adapter._turn_key("oc_1"): "ou_starter"}
+    adapter._progress_card_by_chat = {adapter._turn_key("oc_1"): "om_card_msg"}
+    adapter._final_card_by_chat = {}
     adapter._stop_button_scope = scope
     adapter._admins = set(admins)
     adapter._allowed_group_users = set(allowed)
@@ -110,6 +112,9 @@ def test_click_dispatches_stop_and_marks_the_turn():
     assert len(adapter.dispatched) == 1
     assert adapter.dispatched[0]["text"] == "/stop"
     assert adapter.dispatched[0]["chat_id"] == "oc_1"
+    # The synthetic /stop must anchor on the card the user clicked: a placeholder id made
+    # Feishu reject the acknowledgement with 99992354 and the reply vanished.
+    assert adapter.dispatched[0]["message_id"] == "om_card_msg"
     assert adapter._stopped_turns[adapter._turn_key("oc_1")] == 1_700_000_000.5
     assert adapter._turn_stopped(adapter._turn_key("oc_1")) is True
 
@@ -285,6 +290,16 @@ def test_send_folds_only_when_the_chat_has_one_live_turn():
     assert adapter._sole_live_turn_key("oc_1") == key_a
 
 
+def test_invalid_reply_anchor_is_recognised():
+    """Feishu 99992354 means the quoted message is gone — the send must be retried unanchored."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    bad = ("[99992354] The request you send is not a valid {open_message_id} or not exists, "
+           "and the example format is \"om_xxx\"")
+    assert BasePlatformAdapter._is_invalid_reply_anchor(bad) is True
+    assert BasePlatformAdapter._is_invalid_reply_anchor("[230020] rate limited") is False
+
+
 if __name__ == "__main__":  # pytest is not installed in the runtime venv; this keeps it runnable
     import sys
     import traceback
@@ -300,3 +315,30 @@ if __name__ == "__main__":  # pytest is not installed in the runtime venv; this 
                 print(f"FAIL {name}")
                 traceback.print_exc()
     sys.exit(1 if failed else 0)
+
+
+if __name__ == "__main__":  # pytest is not installed in the runtime venv; this keeps it runnable
+    import sys
+    import traceback
+
+    failed = 0
+    for name, fn in sorted(globals().items()):
+        if name.startswith("test_") and callable(fn):
+            try:
+                fn()
+                print(f"PASS {name}")
+            except Exception:
+                failed += 1
+                print(f"FAIL {name}")
+                traceback.print_exc()
+    sys.exit(1 if failed else 0)
+
+
+def test_invalid_reply_anchor_is_recognised():
+    """Feishu 99992354 means the quoted message is gone — the send must be retried unanchored."""
+    from gateway.platforms.base import BasePlatformAdapter
+
+    bad = ("[99992354] The request you send is not a valid {open_message_id} or not exists, "
+           "and the example format is \"om_xxx\"")
+    assert BasePlatformAdapter._is_invalid_reply_anchor(bad) is True
+    assert BasePlatformAdapter._is_invalid_reply_anchor("[230020] rate limited") is False

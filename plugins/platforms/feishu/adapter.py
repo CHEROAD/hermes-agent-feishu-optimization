@@ -3621,10 +3621,16 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             # The card is from an earlier turn (or another bot's rotation of the same chat).
             logger.info("[Feishu] Stop click on a finished turn (%s != %s) in %s", turn_id, current_turn, chat_id)
             return self._card_response(toast="这一轮已经结束了")
+        # Anchor the synthetic event on the card the user actually clicked. The old
+        # ``stop-<turn>`` placeholder was not a Feishu message id, so the /stop reply was
+        # addressed to a message that does not exist and Feishu rejected it with 99992354 —
+        # the acknowledgement silently never arrived.
+        _anchor = (self._progress_card_by_chat.get(turn_key)
+                   or self._final_card_by_chat.get(turn_key) or "")
         coro = self._dispatch_synthetic_event(
             text="/stop", message_type=MessageType.COMMAND, chat_id=chat_id,
             sender_id=SimpleNamespace(open_id=open_id, user_id=user_id or None, union_id=union_id or None),
-            event_chat_type="group", raw_message=event, message_id=f"stop-{turn_id or chat_id}",
+            event_chat_type="group", raw_message=event, message_id=_anchor,
         )
         self._stopped_turns[turn_key] = self._turn_started_at.get(turn_key, 0.0)
         if not self._submit_on_loop(loop, coro):
