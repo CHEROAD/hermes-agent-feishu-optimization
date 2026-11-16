@@ -2304,6 +2304,11 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         now = time.time()
         prev = self._agent_status.get(chat_id) or {}
         changed = (prev.get("state"), prev.get("detail")) != (state, detail)
+        # A new turn must not inherit the previous turn's clock: the strip would open at
+        # "思考中 · 19s" because the last turn also ended in "thinking".
+        turn_started = getattr(self, "_turn_started_at", {}).get(chat_id) or 0.0
+        if not changed and prev.get("since") and prev["since"] < turn_started:
+            changed = True
         # Repeating the same state (one step per iteration) must not restart the counter, or
         # the strip reads "思考中 · 2s" forever on a long generation.
         since = now if changed or not prev.get("since") else prev["since"]

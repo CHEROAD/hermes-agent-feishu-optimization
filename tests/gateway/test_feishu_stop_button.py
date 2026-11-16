@@ -192,6 +192,28 @@ def test_heartbeat_survives_failed_patches():
     assert "heartbeat iteration failed" in src, "one bad iteration must be caught in the loop"
 
 
+def test_a_new_turn_does_not_inherit_the_previous_turn_clock():
+    """A turn that ended "thinking" must not make the next turn open at "思考中 · 120s"."""
+    import time
+
+    from plugins.platforms.feishu.adapter import FeishuAdapter
+
+    adapter = object.__new__(FeishuAdapter)
+    adapter._agent_status = {}
+    adapter._last_progress_at = {}
+    adapter._turn_started_at = {}
+    adapter._schedule_status_refresh = lambda chat_id: None
+
+    adapter._turn_started_at["oc_1"] = time.time() - 120
+    adapter.note_agent_status("oc_1", "thinking")
+    adapter._agent_status["oc_1"]["since"] -= 120      # that status was two minutes ago
+
+    adapter._turn_started_at["oc_1"] = time.time()     # a new turn begins
+    adapter.note_agent_status("oc_1", "thinking")
+
+    assert time.time() - adapter._agent_status["oc_1"]["since"] < 5
+
+
 if __name__ == "__main__":  # pytest is not installed in the runtime venv; this keeps it runnable
     import sys
     import traceback
