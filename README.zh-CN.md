@@ -13,6 +13,31 @@
   <a href="README.ur-pk.md"><img src="https://img.shields.io/badge/Lang-اردو-green?style=for-the-badge" alt="اردو"></a>
 </p>
 
+> ### 🔧 本仓库：飞书 / Lark 折叠进度卡片
+>
+> [CHEROAD/hermes-agent-feishu-optimization](https://github.com/CHEROAD/hermes-agent-feishu-optimization)
+> 是 [NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent) 的 fork，跟随上游
+> `main`，并在此基础上加了一个飞书专属的交互优化。
+>
+> **改动内容** —— `plugins/platforms/feishu/adapter.py`
+>
+> | | 上游 | 本 fork |
+> |---|---|---|
+> | 工具进度 | 每次工具调用发一条消息，长任务会刷屏 | 合并为一张折叠交互卡片，一步一行，点击展开 |
+> | 最终回复 | 单独发一条消息 | 折叠进进度卡片本身（不超过飞书 30 KB 卡片上限时） |
+> | 长记录 | — | 裁剪为最新的完整行（约 6 KB），并重新平衡代码块 |
+> | 轮次生命周期 | — | 每轮一张卡片，下一轮重新开始 |
+>
+> **开关** —— 折叠卡片默认开启。在 gateway 环境中设置 `HERMES_FEISHU_FOLDED_PROGRESS=0`
+> 可关闭，回退到上游行为。
+>
+> **同步上游**
+>
+> ```bash
+> git fetch upstream          # upstream = https://github.com/NousResearch/hermes-agent.git
+> git rebase upstream/main
+> ```
+
 **由 [Nous Research](https://nousresearch.com) 构建的自进化 AI 代理。** 它是唯一内置学习闭环的智能代理——从经验中创建技能，在使用中改进技能，主动持久化知识，搜索过往对话，并在跨会话中逐步构建对你的深度理解。可以在 $5 的 VPS 上运行，也可以在 GPU 集群上运行，或者使用几乎零成本的 Serverless 基础设施。它不绑定你的笔记本——你可以在 Telegram 上与它对话，而它在云端 VM 上工作。
 
 支持任意模型——[Nous Portal](https://portal.nousresearch.com)、[OpenRouter](https://openrouter.ai)（200+ 模型）、[NVIDIA NIM](https://build.nvidia.com)（Nemotron）、[小米 MiMo](https://platform.xiaomimimo.com)、[z.ai/GLM](https://z.ai)、[Kimi/Moonshot](https://platform.moonshot.ai)、[MiniMax](https://www.minimax.io)、[Hugging Face](https://huggingface.co)、OpenAI，或自定义端点。使用 `hermes model` 即可切换——无需改代码，无锁定。
