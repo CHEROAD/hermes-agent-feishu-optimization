@@ -2091,7 +2091,8 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
                     self._final_card_by_chat.pop(key, None)
                     self._final_card_text.pop(_retired, None)
             if _existing_card:
-                _edited = await self.edit_message(chat_id, _existing_card, content, metadata=metadata)
+                _edited = await self.edit_message(chat_id, _existing_card, content,
+                                                  metadata=metadata, turn_key=key)
                 if _edited.success:
                     return _edited
             try:
@@ -2887,13 +2888,16 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             return SendResult(success=False, error=str(exc))
     async def edit_message(
         self, chat_id: str, message_id: str, content: str, *, finalize: bool = False,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: Optional[dict[str, Any]] = None, turn_key: Optional[str] = None,
     ) -> SendResult:
         """Edit a previously sent Feishu text/post message (or folded progress card)."""
         if not self._client:
             return SendResult(success=False, error="Not connected")
 
         content = self.format_message(content)
+        # Per-turn state (card entity, jobs, status, clock) is keyed by chat|session; the caller
+        # that knows the turn hands it over, everyone else falls back to the chat-scoped key.
+        key = turn_key or self._turn_key(chat_id)
 
         async def _update(msg_type: Optional[str], payload: str, *, method: Any = None) -> SendResult:
             # Card updates go through the CardKit entity when this chat's card has one: same
@@ -2902,7 +2906,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
                 try:
                     _card_obj = json.loads(payload)
                     if isinstance(_card_obj, dict) and _card_obj.get("schema"):
-                        if await self._cardkit_update_card(chat_id, _card_obj):
+                        if await self._cardkit_update_card(key, _card_obj):
                             return SendResult(success=True, message_id=message_id)
                 except Exception:
                     logger.debug("[Feishu] cardkit update path skipped", exc_info=True)
@@ -2925,13 +2929,13 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             try:
                 card_payload = json.dumps(
                     _build_progress_card(
-                        self._decorate_progress_body(chat_id, content), count=_progress_tool_count(metadata),
+                        self._decorate_progress_body(chat_id, content), count=max(_progress_tool_count(metadata), self._progress_card_counts.get(message_id, 0)),
                         reply_open_id=_progress_reply_open_id(metadata),
-                        bg_tasks=self._bg_task_card_tasks.get(chat_id),
-                        subagents=self._subagent_lines(chat_id),
-                        elapsed_s=self._turn_elapsed(chat_id),
-                        status_label=self._status_label(chat_id),
-                        stop_value=self._stop_payload(chat_id),
+                        bg_tasks=self._bg_task_card_tasks.get(key),
+                        subagents=self._subagent_lines(key),
+                        elapsed_s=self._turn_elapsed(key),
+                        status_label=self._status_label(key),
+                        stop_value=self._stop_payload(key, chat_id=chat_id),
                     ), ensure_ascii=False,
                 )
                 result = await _update(None, card_payload, method=getattr(HttpMethod, "PATCH", None))

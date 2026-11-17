@@ -312,7 +312,7 @@ def test_tool_progress_after_an_answer_reuses_the_same_card():
 
     edited = []
 
-    async def _edit(chat_id, message_id, content, metadata=None):
+    async def _edit(chat_id, message_id, content, metadata=None, turn_key=None):
         edited.append(message_id)
         return SendResult(success=True, message_id=message_id)
 
