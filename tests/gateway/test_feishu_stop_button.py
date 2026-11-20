@@ -71,7 +71,10 @@ def _adapter(*, scope="all", admins=(), allowed=(), authorized=True):
     adapter.dispatched = []
     adapter.closed = []
 
-    adapter._is_interactive_operator_authorized = lambda *a, **k: authorized
+    # Upstream moved the operator check into plugins/platforms/feishu/cards/authz.py; drive the
+    # real function through the gateway authorization hook instead of stubbing a method.
+    adapter._chat_info_cache = {}
+    adapter._is_sender_authorized = lambda *a, **k: authorized
 
     async def _noop():
         return None
@@ -237,6 +240,7 @@ def _multi_turn_adapter():
     a._stop_button_scope = "all"
     a._admins = set()
     a._allowed_group_users = set()
+    a._chat_info_cache = {}
     a._loop = None
     return a
 
