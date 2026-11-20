@@ -2054,6 +2054,20 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         ]
         return retired[0] if len(retired) == 1 else None
 
+    def _unfinished_turn_key(self, chat_id: str) -> Optional[str]:
+        """The chat's single started-but-unfinished turn, when exactly one exists.
+
+        Card rebuilds sometimes arrive with a key that never got a turn clock (a background-task
+        refresh without a session key, a replay after a restart). Falling back to the one turn
+        still running keeps its elapsed time and stop button instead of silently dropping both.
+        """
+        prefix = f"{chat_id}|"
+        keys = [
+            k for k, started in self._turn_started_at.items()
+            if k.startswith(prefix) and (self._turn_ended_at.get(k) or 0.0) < started
+        ]
+        return keys[0] if len(keys) == 1 else None
+
     async def send(
         self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[dict[str, Any]] = None,
     ) -> SendResult:
@@ -2515,13 +2529,24 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         """Seconds this turn ran (frozen once the answer landed), else None."""
         started = self._turn_started_at.get(chat_id)
         if not started:
+            fallback = self._unfinished_turn_key(chat_id.split("|", 1)[0])
+            if fallback:
+                chat_id = fallback
+                started = self._turn_started_at.get(fallback)
+        if not started:
             return None
         # A finished turn keeps its final duration: a late background-task patch must not
         # report the wall-clock time since the turn ended.
         return self._turn_ended_at.get(chat_id, time.time()) - started
 
     def _status_label(self, chat_id: str, *, idle: float = 0.0) -> str:
-        st = self._agent_status.get(chat_id) or {}
+        st = self._agent_status.get(chat_id)
+        if st is None:
+            # No status for this key: don't invent 「🧠 思考中 · 0s」 on a card whose turn we
+            # could not identify — a bare 0s status reads as "just started" and hides the fact
+            # that the clock and the stop button are missing too.
+            return ""
+        st = st or {}
         state = st.get("state") or "thinking"
         detail = st.get("detail")
         elapsed = int(time.time() - (st.get("since") or time.time()))
@@ -2851,7 +2876,12 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             return SendResult(success=False, error="Not connected")
         # Only this turn's jobs: anything already shown in an earlier turn stays hidden
         # unless it is still running.
-        chat_id = self._turn_key(chat_id, session_key)
+        if session_key:
+            chat_id = self._turn_key(chat_id, session_key)
+        else:
+            # No session on this refresh: use the chat's live turn so the rebuild keeps its
+            # clock, status and stop button, and only then fall back to the chat-scoped key.
+            chat_id = self._sole_live_turn_key(chat_id) or self._unfinished_turn_key(chat_id) or self._turn_key(chat_id)
         seen = self._bg_seen_ids.get(chat_id, set())
         tasks = [t for t in tasks if t.get("status") == "running" or t.get("id") not in seen]
         self._bg_task_card_tasks[chat_id] = list(tasks)
@@ -2867,6 +2897,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
                     bg_tasks=tasks,
                     subagents=self._subagent_lines(chat_id),
                     elapsed_s=self._turn_elapsed(chat_id),
+                    status_label=self._status_label(chat_id),
                     finished_at=self._card_finished_at(chat_id, folded_id),
                     stopped=self._turn_stopped(chat_id),
                     stop_value=self._stop_payload(chat_id),
@@ -3564,6 +3595,10 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
     def _stop_payload(self, key: str, chat_id: Optional[str] = None) -> Optional[dict[str, Any]]:
         """Card value for the running turn's stop button, or None when it must not render."""
         turn_started = self._turn_started_at.get(key)
+        if turn_started is None:
+            fallback = self._unfinished_turn_key(key.split("|", 1)[0])
+            if fallback:
+                key, turn_started = fallback, self._turn_started_at.get(fallback)
         if turn_started is None:
             return None
         if str(getattr(self, "_stop_button_scope", "all") or "all").lower() == "off":

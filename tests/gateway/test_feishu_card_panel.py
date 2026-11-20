@@ -210,6 +210,35 @@ def test_send_keeps_the_panel_when_the_metadata_carries_no_tool_count():
     assert "工具调用 (3)" in blob, blob
 
 
+def test_a_background_refresh_without_a_session_key_keeps_the_clock_and_the_stop_button():
+    """The bug behind 「🔧 工具调用 (14) / ⚙️ 后台任务 / 🧠 思考中 · 0s」: both were silently dropped.
+
+    The refresh arrives with a chat id only, the rebuild used the bare chat key, every per-turn
+    lookup missed, and the card fell back to a default 「思考中 · 0s」 with no 已耗时 and no 停止.
+    """
+    a = _adapter()
+    key = a._turn_key(chat, "s1")
+    a._progress_card_by_chat[key] = "msg-1"
+    a._progress_card_bodies["msg-1"] = "💻 terminal · 4s"
+    a._progress_card_counts["msg-1"] = 14
+    a._turn_started_at[key] = time.time() - 95
+    a._agent_status[key] = {"state": "tool", "label": "💻 terminal", "since": time.time() - 4}
+    seen = _patch_card(a)
+
+    asyncio.run(a.update_background_tasks_card(chat, [{"id": "j1", "status": "done", "command": "pytest -q"}]))
+
+    blob = json.dumps(seen["card"], ensure_ascii=False)
+    assert "🔧 工具调用中" in blob, blob
+    assert "⏳" in blob, "the elapsed footer was dropped"
+    assert "hermes_stop_action" in blob, "the stop button was dropped"
+    assert "思考中 · 0s" not in blob, "a fake status replaced the real one"
+
+
+def test_an_unknown_turn_key_renders_no_status_rather_than_a_fake_one():
+    a = _adapter()
+    assert a._status_label("oc_group|nobody") == ""
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):
