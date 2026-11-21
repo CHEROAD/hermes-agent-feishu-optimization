@@ -1682,6 +1682,9 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         self._subagent_seq: dict[str, int] = {}
         # Per-line first-seen stamps, so finished tools can show their elapsed time.
         self._line_first_seen: dict[str, dict[str, float]] = {}
+        # When each row was first seen as finished: the elapsed time it shows must stay frozen
+        # there, however often the heartbeat re-renders the same body.
+        self._line_done_at: dict[str, dict[str, float]] = {}
         # Status-refresh throttle: tool events already patch the card, so a state change within
         # the same second doesn't need a second round-trip.
         self._status_refresh_at: dict[str, float] = {}
@@ -2489,6 +2492,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             return content
         now = time.time()
         seen = self._line_first_seen.setdefault(chat_id, {})
+        done = self._line_done_at.setdefault(chat_id, {})
         state = (self._agent_status.get(chat_id) or {}).get("state")
         running = -1 if state in {"thinking", "waiting"} else len(lines) - 1
         out: list[str] = []
@@ -2497,7 +2501,11 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
             if key:
                 seen.setdefault(key, now)
             if i != running and key and _TOOL_ROW_RE.match(line) and not re.search(r"·\s*\d+s$", line):
-                dur = int(now - seen.get(key, now))
+                # The row is finished: stamp when it finished, not this render's clock. The
+                # heartbeat re-renders the same body every few seconds, so measuring from "now"
+                # turned a 12-second call into a 15060-second one.
+                ended = done.setdefault(key, now)
+                dur = int(ended - seen.get(key, ended))
                 if dur >= 1:
                     line = f"{line.rstrip()} · {dur}s"
             out.append(line)
@@ -2694,6 +2702,7 @@ class FeishuAdapter(FeishuChoiceCardsMixin, FeishuSyntheticEventsMixin, BasePlat
         self._subagents.pop(key, None)
         self._subagent_seq[key] = 0
         self._line_first_seen.pop(key, None)
+        self._line_done_at.pop(key, None)
         self.note_agent_status(key, "thinking")
         card = _build_progress_card(
             "", count=0, reply_open_id=_progress_reply_open_id(metadata),

@@ -234,7 +234,7 @@ def _multi_turn_adapter():
                  "_progress_card_counts", "_final_card_by_chat", "_final_card_text",
                  "_card_id_by_chat", "_card_seq", "_agent_status", "_last_progress_at",
                  "_last_card_update_at", "_status_refresh_at", "_heartbeat_tasks",
-                 "_bg_task_card_tasks", "_subagents", "_subagent_seq", "_line_first_seen",
+                 "_bg_task_card_tasks", "_subagents", "_subagent_seq", "_line_first_seen", "_line_done_at",
                  "_bg_seen_ids", "_final_card_at"):
         setattr(a, name, {})
     a._stop_button_scope = "all"
